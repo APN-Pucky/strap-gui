@@ -160,10 +160,10 @@ impl eframe::App for MyApp {
 
                 }
 
-                ui.separator();
 
                 if let Some(parquet_path) = &self.parquet_path {
                     ui.label(format!("Loaded file: {:?}", parquet_path.as_str()));
+                    ui.separator();
 
                     egui::ComboBox::from_label("Key")
                         .selected_text(self.key.as_ref().map_or("None", |k| k.as_str()))
@@ -223,7 +223,7 @@ impl eframe::App for MyApp {
             ui.label("Last SQL Query:");
             ui.code(&self.sql.last_query);
             ui.separator();
-            ui.label("Last SQError:");
+            ui.label("Last SQL Error:");
             ui.code(&self.sql.last_error);
 
         });

@@ -1,41 +1,468 @@
-use stattrak::StatTrack;
-use std::env;
-use std::collections::HashMap;
+use core::panic;
+use std::{collections::HashMap, error::Error, ops::Deref, path::{Path, PathBuf}, time::Instant};
+use std::fmt::{Display, Formatter, Result as FmtResult};
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args: Vec<String> = env::args().collect();
-    
-    if args.len() != 2 {
-        eprintln!("Usage: {} <strap_file>", args[0]);
-        std::process::exit(1);
+use duckdb::{Connection, params};
+use eframe::egui;
+use egui_plot::{Bar, BarChart, Line, Plot, PlotPoints};
+use egui_file_dialog::FileDialog;
+use strum::IntoEnumIterator;
+use strum_macros::{Display, EnumIter};
+
+use stattrak::StatTrack;
+
+
+// TODO filter, 2d plots, move key to operations, histogram
+// gzip support
+// TODO LOGY, LOGX options
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ParsedString(String);
+
+impl Deref for ParsedString {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
     }
-    
-    let file_path = &args[1];
-    let stats = StatTrack::new(file_path)?;
-    
-    // Get all column names
-    let column_names = stats.get_column_names()?;
-    
-    if column_names.is_empty() {
-        println!("No columns found in STRAP file");
-        return Ok(());
+}
+impl Display for ParsedString {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        write!(f, "{}", self.0)
     }
-    
-    println!("Aggregating {} columns from STRAP file: {}", column_names.len(), file_path);
-    println!();
-    
-    // For each column, calculate the sum
-    for column_name in &column_names {
-        let sum = stats.aggregate(0.0, |acc, row| {
-            if let Some(&value) = row.get(column_name) {
-                acc + value
-            } else {
-                acc
+}
+impl ParsedString {
+    fn parse(name: &str) -> duckdb::Result<ParsedString> {
+        // Allow only letters, numbers, slash, double dot and underscores
+        if name.is_empty() {
+            return Err(duckdb::Error::InvalidParameterName("Identifier cannot be empty".to_owned()));
+        }
+
+        if !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || ' ' == c || c == '_' || c == '/' || c == '.' || c == ':')
+        {
+            return Err(duckdb::Error::InvalidParameterName(format!("Invalid identifier: {}", name)));
+        }
+
+        // Safe: return the identifier as-is
+        Ok(Self(name.to_string()))
+    }
+
+    /// Optionally, allow read-only access to inner string
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+struct SQL {
+    conn: duckdb::Connection,
+    last_query: String,
+    last_error: String,
+}
+
+impl SQL {
+    fn prepare(&mut self, query: &str) -> duckdb::Result<duckdb::Statement> {
+        self.last_query = query.to_string();
+        self.conn.prepare(query)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, EnumIter, Display)]
+enum Operation {
+    Aggregate,
+    Histogram,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, EnumIter, Display)]
+enum Aggregation {
+    Stat,
+}
+
+struct MyApp {
+    selected: String,
+    operation: Operation,
+    aggregation: Aggregation,
+    filedialog: FileDialog,
+    file : Option<PathBuf>,
+    cache : Cache,
+
+    sql : SQL,
+    parquet_path : Option<ParsedString>,
+
+
+    key : Option<ParsedString>,
+    histogram_bins : usize,
+}
+
+impl Default for MyApp {
+    fn default() -> Self {
+        Self {
+            sql : SQL {
+                conn: Connection::open_in_memory().unwrap(),
+                last_query: "".to_string(),
+                last_error: "".to_string(),
+            },
+            file : None,
+            filedialog: FileDialog::new(),
+            selected: "".to_string(),
+            operation: Operation::Aggregate,
+            aggregation: Aggregation::Stat,
+            parquet_path: None,
+            cache: Cache {
+                histogram : HashMap::new(),
+                column_names : HashMap::new(),
+                stat: HashMap::new(),
+            },
+            key: None,
+            histogram_bins: 10,
+        }
+    }
+}
+
+impl eframe::App for MyApp {
+    fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.heading("STRAP GUI");
+
+            ui.separator();
+
+            if ui.button("Select files").clicked() {
+                self.filedialog.select_file();
             }
-        })?;
-        
-        println!("{}: {}", column_name, sum);
+            
+            // Update the dialog
+            self.filedialog.update(ctx);
+
+            let selected = self.filedialog.selected();
+
+            // Check if the user picked a file.
+            if let Some(path) = selected {
+                let file = path.to_path_buf();
+
+                if self.file.is_none() || file.to_str() != self.file.clone().unwrap().to_str() {
+                    self.parquet_path = ParsedString::parse(&format!("{}.parquet", file.to_string_lossy())).ok();
+                    if let Some(parquetpath) = &self.parquet_path {
+                        // if file does not end in .parquet, convert to parquet
+                        if file.extension().and_then(|s| s.to_str()) != Some("parquet") {
+                            if let Some (st) = StatTrack::new(&file).ok() {
+                                st.to_parquet(&parquetpath).ok();
+                            }
+                        } else {
+                            self.parquet_path = ParsedString::parse(&file.to_string_lossy()).ok();
+                        }
+                        self.file = Some(file); 
+                    }
+                    else {
+                        ui.label("Faulty characters in file path");
+                        return;
+                    }
+
+                }
+
+                ui.separator();
+
+                if let Some(parquet_path) = &self.parquet_path {
+                    ui.label(format!("Loaded file: {:?}", parquet_path.as_str()));
+
+                    egui::ComboBox::from_label("Key")
+                        .selected_text(self.key.as_ref().map_or("None", |k| k.as_str()))
+                        .show_ui(ui, |ui| {
+                            for name in get_column_names(&mut self.cache, &mut self.sql, ColumnNamesInput { table: parquet_path.clone() }) {
+                                ui.selectable_value(&mut self.key, Some(name.clone()), name.as_str());
+                            }
+                    });
+
+                    if let Some(key) = &self.key {
+                        //ui.label(format!("Selected: {}", self.selected));
+                        egui::ComboBox::from_label("Operation")
+                            .selected_text(&self.operation.to_string())
+                            .show_ui(ui, |ui| {
+                                for op in Operation::iter() {
+                                    ui.selectable_value(&mut self.operation, op, op.to_string());
+                                }
+                            });
+
+                        match self.operation {
+                            Operation::Aggregate => {
+                                egui::ComboBox::from_label("Aggregation")
+                                    .selected_text(&self.aggregation.to_string())
+                                    .show_ui(ui, |ui| {
+                                        for agg in Aggregation::iter() {
+                                            ui.selectable_value(&mut self.aggregation, agg, agg.to_string());
+                                        }
+                                    });
+                                match self.aggregation {
+                                    Aggregation::Stat => {
+                                        draw_stat(
+                                            ui,
+                                            get_stat(&mut self.cache, &mut self.sql, &StatInput {
+                                                table: parquet_path.clone(),
+                                                column: key.clone(),
+                                            }),
+                                        )
+                                    },
+                                }
+                            },
+                            Operation::Histogram => {
+
+                                ui.add(egui::DragValue::new(&mut self.histogram_bins).suffix("Bins"));
+
+                                draw_histogram(ui, get_histogram(&mut self.cache, &mut self.sql, &HistogramInput {
+                                    table: parquet_path.clone(),
+                                    column: key.clone(),
+                                    bins: self.histogram_bins,
+                                }));
+                            }
+                        }
+                    }
+                }
+            }
+            // Display last SQL query and error
+            ui.separator();
+            ui.label("Last SQL Query:");
+            ui.code(&self.sql.last_query);
+            ui.separator();
+            ui.label("Last SQError:");
+            ui.code(&self.sql.last_error);
+
+        });
     }
-    
-    Ok(())
+}
+
+fn get_column_names<'a>(cache : &'a mut Cache, sql: &mut SQL, input : ColumnNamesInput) -> &'a Vec<ParsedString> {
+    if ! cache.column_names.contains_key(&input) {
+        match compute_column_names(sql, &input) {
+            Ok(res) => {
+                cache.column_names.insert(input.clone(), res);
+            },
+            Err(e) => {
+                sql.last_error = format!("Error computing column names: {:?}", e);
+                cache.column_names.insert(input.clone(), ColumnNamesOutput { names : vec![] });
+            }
+        }
+    }
+    if let Some(res) = cache.column_names.get(&input) {
+        &res.names
+    }
+    else {
+        panic!("Column names cache miss");
+    }
+}
+
+fn compute_column_names(
+    sql: &mut SQL,
+    input : &ColumnNamesInput,
+) -> duckdb::Result<ColumnNamesOutput> {
+    let mut stmt = sql.prepare(
+        format!(
+        r#"
+        DESCRIBE SELECT * FROM '{}';
+       "#,&input.table.as_str()
+        ).as_str()
+    )?;
+    let column_names = stmt.query_map(params![], |row| {
+        ParsedString::parse(&row.get::<_, String>(0)?)
+        //Ok(row.get::<_, String>(1)?)
+    })?
+    .collect::<duckdb::Result<Vec<_>>>()?;
+    Ok(ColumnNamesOutput { names: column_names })
+}
+
+struct ColumnNamesOutput {
+    names : Vec<ParsedString>,
+}
+
+#[derive(Hash, Eq, PartialEq, Clone)]
+struct ColumnNamesInput {
+    table : ParsedString,
+}
+
+
+struct Cache {
+    column_names : HashMap<ColumnNamesInput, ColumnNamesOutput>,
+    histogram : HashMap<HistogramInput, HistogramOutput>,
+    stat : HashMap<StatInput, StatOutput>,
+}
+
+#[derive(Hash, Eq, PartialEq, Clone)]
+struct HistogramInput {
+    table : ParsedString,
+    column : ParsedString,
+    bins: usize,
+}
+
+struct HistogramOutput {
+    // (bin_center, count, bin_width)
+    data : Vec<(f64, f64, f64)>,
+}
+
+
+fn get_histogram<'a>(cache : &'a mut Cache, sql: &mut SQL, input : &'a HistogramInput) -> &'a HistogramOutput {
+    if !cache.histogram.contains_key(&input) {
+        match compute_histogram(sql, &input){
+            Ok(res) => {
+                cache.histogram.insert(input.clone(), res);
+            },
+            Err(e) => {
+                sql.last_error = format!("Error computing histogram: {:?}", e);
+                cache.histogram.insert(input.clone(), HistogramOutput { data : vec![] });
+            }
+        }
+    }
+    if let Some(res) = cache.histogram.get(&input) {
+        res
+    }
+    else {
+        panic!("Histogram cache miss");
+    }
+}
+
+fn compute_histogram(
+    sql: &mut SQL,
+    hist : &HistogramInput,
+) -> duckdb::Result<HistogramOutput> {
+    let stmt = sql.prepare(
+        format!(
+        r#"
+SELECT
+    LEAST(stats.n_bins - 1,
+          CAST(FLOOR((t.{} - stats.min_val) / ((stats.max_val - stats.min_val) / stats.n_bins)) AS INTEGER)
+    ) AS bucket,
+    COUNT(*) AS count,
+    (stats.max_val - stats.min_val) / stats.n_bins AS bin_width,
+    stats.min_val + (
+        (LEAST(stats.n_bins - 1,
+               CAST(FLOOR((t.{} - stats.min_val) / ((stats.max_val - stats.min_val) / stats.n_bins)) AS INTEGER)
+        ) + 0.5) * ((stats.max_val - stats.min_val) / stats.n_bins)
+    ) AS midpoint
+FROM '{}' as t
+JOIN (
+    SELECT MIN({}) AS min_val, MAX({}) AS max_val, {} AS n_bins
+    FROM '{}'
+) AS stats
+ON TRUE
+GROUP BY bucket, stats.min_val, stats.max_val, stats.n_bins
+ORDER BY bucket;
+        "#,
+        hist.column,
+        hist.column,
+        hist.table ,
+        hist.column,
+        hist.column,
+        hist.bins as i64,
+        hist.table
+    ).as_str())?.query_map(params![ ], |row| {
+        Ok((
+            row.get::<_, i64>(3)? as f64,
+            row.get::<_, i64>(1)? as f64,
+            row.get::<_, i64>(2)? as f64,
+        ))
+    })?
+    .collect::<duckdb::Result<Vec<_>>>()?;
+    Ok(HistogramOutput { data: stmt })
+}
+
+#[derive(Hash, Eq, PartialEq, Clone)]
+struct StatInput {
+    table : ParsedString,
+    column : ParsedString,
+}
+
+struct StatOutput {
+    sum: f64,
+    count: usize,
+    mean: f64,
+    stddev: f64,
+}
+
+fn get_stat<'a>(cache : &'a mut Cache, sql: &mut SQL, input: &StatInput) -> &'a StatOutput {
+    if !cache.stat.contains_key(&input) {
+        match compute_stat(sql, &input) {
+            Ok(res) => {
+                cache.stat.insert(input.clone(), res);
+            },
+            Err(e) => {
+                sql.last_error = format!("Error computing stat: {:?}", e);
+                cache.stat.insert(input.clone(), StatOutput { sum: 0.0, count: 0, mean: 0.0, stddev: 0.0 });
+            }
+        }
+    }
+    if let Some(res) = cache.stat.get(&input) {
+        res
+    }
+    else {
+        panic!("Stat cache miss");
+    }
+}
+
+fn compute_stat(
+    sql: &mut SQL,
+    stat_input : &StatInput,
+) -> duckdb::Result<StatOutput> {
+
+    let stmt = sql.prepare(
+        format!(
+        r#"
+        SELECT 
+            SUM({}) as sum,
+            COUNT({}) as count, 
+            AVG({}) as mean,
+            STDDEV({}) as stddev
+        FROM '{}'
+       "#,
+        stat_input.column,
+        stat_input.column,
+        stat_input.column,
+        stat_input.column,
+        stat_input.table 
+        ).as_str()
+    )?.query_map(params![ ], |row| {
+        Ok(StatOutput {
+            sum: row.get(0)?,
+            count: row.get(1)?,
+            mean: row.get(2)?,
+            stddev: row.get(3)?,
+        })
+    })?
+    .next();
+
+    if let Some(stat) = stmt {
+        stat
+    } else {
+        Err(duckdb::Error::QueryReturnedNoRows)
+    }
+
+}
+
+fn draw_stat(ui: &mut egui::Ui, stat : & StatOutput ) {
+    ui.label(format!("Sum: {:.4}", stat.sum));
+    ui.label(format!("Count: {}", stat.count));
+    ui.label(format!("Mean: {:.4}", stat.mean));
+    ui.label(format!("Std Dev: {:.4}", stat.stddev));
+}
+
+
+fn draw_histogram(ui: &mut egui::Ui, hist : &HistogramOutput ) {
+    let bars: Vec<Bar> = hist.data
+        .iter()
+        .map(|(x, y, w)| Bar::new(*x, *y).width(*w))
+        .collect();
+
+    let chart = BarChart::new(bars);
+
+    Plot::new("histogram")
+        .height(300.0)
+        .show(ui, |plot_ui| {
+            plot_ui.bar_chart(chart);
+        });
+}
+
+fn main() -> Result<(), eframe::Error> {
+    let options = eframe::NativeOptions::default();
+    eframe::run_native(
+        "STRAP GUI",
+        options,
+        Box::new(|_| Box::new(MyApp::default())),
+    )
 }

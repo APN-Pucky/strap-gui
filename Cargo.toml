@@ -22,5 +22,5 @@ strum_macros = "0.26"
 rand = "0.8"
 parquet = "*"
 arrow = "*"
-polars = { version = "0.32", features = ["parquet", "lazy"] }
-polars-lazy = {version = "0.32", features = ["parquet"]}
+itertools = "0.10"
+duckdb = { version = "=1.4.3", features = ["bundled", "parquet"] }

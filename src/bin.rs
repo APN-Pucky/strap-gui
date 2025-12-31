@@ -4,7 +4,7 @@ use std::fmt::{Display, Formatter, Result as FmtResult};
 
 use duckdb::{Connection, params};
 use eframe::egui;
-use egui_plot::{Bar, BarChart, Line, Plot, PlotPoints};
+use egui_plot::{Bar, BarChart, Line, Plot, PlotItem, PlotPoints, Polygon};
 use egui_file_dialog::FileDialog;
 use strum::IntoEnumIterator;
 use strum_macros::{Display, EnumIter};
@@ -12,9 +12,7 @@ use strum_macros::{Display, EnumIter};
 use stattrak::StatTrack;
 
 
-// TODO filter, 2d plots, move key to operations, histogram
-// gzip support
-// TODO LOGY, LOGX options
+
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ParsedString(String);
@@ -93,6 +91,7 @@ struct MyApp {
 
     key : Option<ParsedString>,
     histogram_bins : usize,
+    histogram_value_type : HistorgramValueType,
 }
 
 impl Default for MyApp {
@@ -116,6 +115,7 @@ impl Default for MyApp {
             },
             key: None,
             histogram_bins: 10,
+            histogram_value_type: HistorgramValueType::Count,
         }
     }
 }
@@ -206,13 +206,39 @@ impl eframe::App for MyApp {
                             },
                             Operation::Histogram => {
 
-                                ui.add(egui::DragValue::new(&mut self.histogram_bins).suffix("Bins"));
+                                ui.add(egui::DragValue::new(&mut self.histogram_bins)
+                                    .prefix("Bins: ")
+                                );
 
-                                draw_histogram(ui, get_histogram(&mut self.cache, &mut self.sql, &HistogramInput {
+                                // Add GUI for selecting histogram value type
+                                egui::ComboBox::from_label("Value Type")
+                                    .selected_text(&self.histogram_value_type.to_string())
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(&mut self.histogram_value_type, HistorgramValueType::Count, "Count");
+                                        
+                                        // For Sum and Avg, show available columns
+                                        for col in get_column_names(&mut self.cache, &mut self.sql, ColumnNamesInput { table: parquet_path.clone() }) {
+                                            ui.selectable_value(
+                                                &mut self.histogram_value_type, 
+                                                HistorgramValueType::Sum(col.clone()), 
+                                                format!("Sum({})", col)
+                                            );
+                                        }
+                                        for col in get_column_names(&mut self.cache, &mut self.sql, ColumnNamesInput { table: parquet_path.clone() }) {
+                                            ui.selectable_value(
+                                                &mut self.histogram_value_type, 
+                                                HistorgramValueType::Avg(col.clone()), 
+                                                format!("Avg({})", col)
+                                            );
+                                        }
+                                    });
+
+                                draw_histogram(ui, &mut self.cache, &mut self.sql, &HistogramInput {
                                     table: parquet_path.clone(),
                                     column: key.clone(),
                                     bins: self.histogram_bins,
-                                }));
+                                    value_type: self.histogram_value_type.clone(),
+                                });
                             }
                         }
                     }
@@ -290,11 +316,21 @@ struct HistogramInput {
     table : ParsedString,
     column : ParsedString,
     bins: usize,
+    value_type: HistorgramValueType,
+}
+
+#[derive(Hash, Eq, PartialEq, Clone, Display)]
+enum HistorgramValueType {
+    Count,
+    #[strum(to_string = "Sum({0})")]
+    Sum(ParsedString),
+    #[strum(to_string = "Avg({0})")]
+    Avg(ParsedString),
 }
 
 struct HistogramOutput {
-    // (bin_center, count, bin_width)
-    data : Vec<(f64, f64, f64)>,
+    // (bin_center, count, bin_width, stddev)
+    data : Vec<(f64, f64, f64, f64)>,
 }
 
 
@@ -322,6 +358,16 @@ fn compute_histogram(
     sql: &mut SQL,
     hist : &HistogramInput,
 ) -> duckdb::Result<HistogramOutput> {
+    let y_value = match &hist.value_type {
+        HistorgramValueType::Count => "COUNT(*)".to_string(),
+        HistorgramValueType::Sum(col) => format!("SUM({})", col),
+        HistorgramValueType::Avg(col) => format!("AVG({})", col),
+    };
+    let y_error= match &hist.value_type {
+        HistorgramValueType::Count => "SQRT(COUNT(*))".to_string(),
+        HistorgramValueType::Sum(col) => format!("STDDEV({})", col),
+        HistorgramValueType::Avg(col) => format!("STDDEV({})", col),
+    };
     let stmt = sql.prepare(
         format!(
         r#"
@@ -329,7 +375,8 @@ SELECT
     LEAST(stats.n_bins - 1,
           CAST(FLOOR((t.{} - stats.min_val) / ((stats.max_val - stats.min_val) / stats.n_bins)) AS INTEGER)
     ) AS bucket,
-    COUNT(*) AS count,
+    {} AS yvalue,
+    {} AS yerror,
     (stats.max_val - stats.min_val) / stats.n_bins AS bin_width,
     stats.min_val + (
         (LEAST(stats.n_bins - 1,
@@ -346,6 +393,8 @@ GROUP BY bucket, stats.min_val, stats.max_val, stats.n_bins
 ORDER BY bucket;
         "#,
         hist.column,
+        y_value,
+        y_error,
         hist.column,
         hist.table ,
         hist.column,
@@ -354,8 +403,9 @@ ORDER BY bucket;
         hist.table
     ).as_str())?.query_map(params![ ], |row| {
         Ok((
-            row.get::<_, i64>(3)? as f64,
+            row.get::<_, i64>(4)? as f64,
             row.get::<_, i64>(1)? as f64,
+            row.get::<_, i64>(3)? as f64,
             row.get::<_, i64>(2)? as f64,
         ))
     })?
@@ -443,17 +493,48 @@ fn draw_stat(ui: &mut egui::Ui, stat : & StatOutput ) {
 }
 
 
-fn draw_histogram(ui: &mut egui::Ui, hist : &HistogramOutput ) {
+fn draw_histogram<'a>(ui: &mut egui::Ui, 
+                      cache : &'a mut Cache,
+                      sql: &mut SQL,
+                      input : &'a HistogramInput,
+    ) {
+    let hist = get_histogram(cache, sql, input);
+    let polygons = hist.data.iter().map(|(x, y, w, e)| {
+        Polygon::new(vec![
+            [x - w/2., y + e / 2.],
+            [x - w/2., y - e / 2.],
+            [x + w/2., y - e / 2.],
+            [x + w/2., y + e / 2.],
+        ])
+    }).collect::<Vec<Polygon>>();
+
+
     let bars: Vec<Bar> = hist.data
         .iter()
-        .map(|(x, y, w)| Bar::new(*x, *y).width(*w))
+        .map(|(x, y, w, h)| 
+            Bar::new(*x, *h)
+                .width(*w)
+                .base_offset(y-h/2.)
+                .name(format!("Value: {:.3} ± {:.3}\nRange: [{:.3}, {:.3}]\nWidth: {:.3}", 
+                             y, h, x - w/2., x + w/2., w))
+            )
         .collect();
 
-    let chart = BarChart::new(bars);
+    let chart = BarChart::new(bars).element_formatter(Box::new(|bar, _chart| bar.name.clone()));
 
     Plot::new("histogram")
         .height(300.0)
+        .x_axis_label(input.table.as_str())
+        .y_axis_label(match &input.value_type {
+            HistorgramValueType::Count =>  "#".to_owned(),
+            HistorgramValueType::Avg(col) => "Avg of ".to_owned() + col.as_str(),
+            HistorgramValueType::Sum(col) => "Sum of ".to_owned() + col.as_str(),
+
+        })
         .show(ui, |plot_ui| {
+            //for polygon in polygons {
+            //    plot_ui.polygon(polygon);
+            //}
             plot_ui.bar_chart(chart);
         });
 }

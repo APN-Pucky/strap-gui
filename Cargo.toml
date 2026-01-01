@@ -1,15 +1,15 @@
 
 [package]
-name = "stattrak"
+name = "straptrack"
 version = "0.1.0"
 edition = "2024"
 
 [lib]
-name = "stattrak"
+name = "straptrack"
 path = "src/lib.rs"
 
 [[bin]]
-name = "stattrak-bin"
+name = "strap-gui"
 path = "src/bin.rs"
 
 [dependencies]

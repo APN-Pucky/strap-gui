@@ -1,10 +1,9 @@
 use core::panic;
-use std::{collections::HashMap, error::Error, fmt::format, ops::Deref, path::{Path, PathBuf}, time::Instant};
+use std::{collections::HashMap, error::Error, fmt::{self, format}, ops::Deref, path::{Path, PathBuf}, time::Instant};
 use std::fmt::{Display, Formatter, Result as FmtResult};
 
 use duckdb::{Connection, arrow::compute::kernels::coalesce, params};
 use eframe::egui;
-use egui::gui_zoom::kb_shortcuts;
 use egui_plot::{Bar, BarChart, Legend, Line, Plot, PlotItem, PlotPoints, Polygon};
 use egui_file_dialog::FileDialog;
 use strum::IntoEnumIterator;
@@ -12,6 +11,96 @@ use strum_macros::{Display, EnumIter};
 
 use stattrak::StatTrack;
 
+#[derive(Hash, Eq, PartialEq, Clone)]
+struct SQLFilter {
+    // Each Vec<SQLFilterComparison> is an OR group
+    // All groups must be satisfied (AND between groups)
+    conditions  : Vec<Vec<SQLFilterComparison >>,
+}
+
+impl SQLFilter {
+    fn is_empty(&self) -> bool {
+        self.conditions.is_empty() || self.conditions.iter().all(|group| group.is_empty())
+    }
+
+    fn to_sql(&self) -> String {
+        self.conditions.iter().map(|group| {
+            "(".to_string()
+            + group.iter().map(|c| c.to_sql()).collect::<Vec<_>>().join(" OR ").as_str()
+            + ")"
+        }).collect::<Vec<_>>().join(" AND ")
+    }
+
+    fn to_sql_and_prefix(&self) -> String {
+        let mut query = String::new();
+        if !self.is_empty() {
+            query.push_str(" AND ");
+            query.push_str(self.to_sql().as_str());
+        }
+        query
+    }
+
+    fn to_sql_where_prefix(&self) -> String {
+        let mut query = String::new();
+        if !self.is_empty() {
+            query.push_str(" WHERE ");
+            query.push_str(self.to_sql().as_str());
+        }
+        query
+    }
+}
+
+#[derive(Hash, Eq, PartialEq, Clone)]
+struct SQLFilterComparison {
+    left: SQLFilterComparisonValue,
+    comparison: SQLFilterComparisonOperation,
+    right: SQLFilterComparisonValue,
+}
+
+#[derive(Hash, Eq, PartialEq, Clone)]
+enum SQLFilterComparisonValue {
+    Column(ParsedString),
+    Number(String),
+}
+
+impl fmt::Display for SQLFilterComparisonValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Column(col) => write!(f, "{}", col),
+            Self::Number(num) => write!(f, "{}", num),
+        }
+    }
+}
+
+impl SQLFilterComparison {
+    fn to_sql(&self) -> String {
+        format!("{} {} {}", self.left, self.comparison, self.right)
+    }
+}
+
+#[derive(Hash, Eq, PartialEq, Clone, EnumIter)]
+enum SQLFilterComparisonOperation {
+    Equal,
+    NotEqual,
+    GreaterThan,
+    LessThan,
+    GreaterThanOrEqual,
+    LessThanOrEqual,
+}
+
+impl fmt::Display for SQLFilterComparisonOperation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            Self::Equal => "=",
+            Self::NotEqual => "!=",
+            Self::GreaterThan => ">",
+            Self::LessThan => "<",
+            Self::GreaterThanOrEqual => ">=",
+            Self::LessThanOrEqual => "<=",
+        };
+        write!(f, "{s}")
+    }
+}
 
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -216,6 +305,7 @@ impl eframe::App for MyApp {
                                         self.histogram_view.input.curves.push(HistogramSubInput {
                                             id : self.global_id_counter,
                                             table: parquetpath.clone(),
+                                            filter: SQLFilter { conditions: vec![] },
                                             x_key: key.clone(),
                                             value_type: HistogramAggregation::Count,
                                             y_key: key.clone(),
@@ -280,6 +370,143 @@ impl eframe::App for MyApp {
                                                 }
                                         });
 
+                                        // Add expandable filter section
+                                        egui::CollapsingHeader::new("Filters")
+                                            .id_source(format!("filters_{}", curve.id))
+                                            .default_open(true)
+                                            .show(ui, |ui| {
+                                                // Add new filter group button
+                                                if ui.button("Add Filter Group").clicked() {
+                                                    curve.filter.conditions.push(vec![]);
+                                                }
+
+                                                let mut groups_to_remove = Vec::new();
+
+                                                for (group_idx, group) in curve.filter.conditions.iter_mut().enumerate() {
+                                                    ui.horizontal(|ui| {
+                                                        ui.label(format!("OR Group {}", group_idx + 1));
+                                                        if ui.button("Remove Group").clicked() {
+                                                            groups_to_remove.push(group_idx);
+                                                        }
+                                                    });
+
+                                                    ui.indent(format!("group_{}", group_idx), |ui| {
+                                                        // Add condition to group button
+                                                        if ui.button("Add Condition").clicked() {
+                                                            group.push(SQLFilterComparison {
+                                                                left: SQLFilterComparisonValue::Number("0".to_string()),
+                                                                comparison: SQLFilterComparisonOperation::Equal,
+                                                                right: SQLFilterComparisonValue::Number("0".to_string()),
+                                                            });
+                                                        }
+
+                                                        let mut conditions_to_remove = Vec::new();
+
+                                                        for (cond_idx, condition) in group.iter_mut().enumerate() {
+                                                            ui.horizontal(|ui| {
+
+                                                                if ui.small_button("x").clicked() {
+                                                                    conditions_to_remove.push(cond_idx);
+                                                                }
+
+                                                                let mut is_column = matches!(condition.right, SQLFilterComparisonValue::Column(_));
+
+                                                                ui.checkbox(&mut is_column, "Column");
+
+
+                                                                // Left side (column selection)
+                                                                egui::ComboBox::new(format!("left_{}_{}", group_idx, cond_idx), "")
+                                                                    .selected_text(condition.left.to_string())
+                                                                    .show_ui(ui, |ui| {
+                                                                        for col in columns {
+                                                                            ui.selectable_value(&mut condition.left, SQLFilterComparisonValue::Column(col.clone()), col.as_str());
+                                                                        }
+                                                                    });
+                                                                
+                                                                // Comparison operator
+                                                                egui::ComboBox::new(format!("op_{}_{}", group_idx, cond_idx), "")
+                                                                    .selected_text(condition.comparison.to_string())
+                                                                    .show_ui(ui, |ui| {
+                                                                        for op in SQLFilterComparisonOperation::iter() {
+                                                                            ui.selectable_value(&mut condition.comparison, op.clone(), op.to_string());
+                                                                        }
+                                                                    });
+
+                                                                if is_column {
+                                                                    if let SQLFilterComparisonValue::Number(_) = condition.right {
+                                                                        // Reset to first column if previously a number
+                                                                        condition.right = SQLFilterComparisonValue::Column(columns.get(0).cloned().unwrap_or(ParsedString::parse("0").unwrap()));
+                                                                    }
+                                                                    // Column selection dropdown
+                                                                    let current_col = match &condition.right {
+                                                                        SQLFilterComparisonValue::Column(col) => col.as_str(),
+                                                                        SQLFilterComparisonValue::Number(_) => columns.get(0).map(|c| c.as_str()).unwrap_or(""),
+                                                                    };
+        
+                                                                    egui::ComboBox::new(format!("right_col_{}_{}", group_idx, cond_idx),"")
+                                                                        .selected_text(current_col)
+                                                                        .show_ui(ui, |ui| {
+                                                                            for col in columns {
+                                                                                ui.selectable_value(&mut condition.right, SQLFilterComparisonValue::Column(col.clone()), col.as_str());
+                                                                            }
+                                                                        });
+                                                                }
+                                                                else {
+                                                                    if let SQLFilterComparisonValue::Column(_) = condition.right {
+                                                                        // Reset to 0 if previously a column
+                                                                        condition.right = SQLFilterComparisonValue::Number("0".to_string());
+                                                                    }
+                                                                    // Right side is a number
+                                                                    let mut value_text = if let SQLFilterComparisonValue::Number(ref num) = condition.right {
+                                                                        num.clone()
+                                                                    } else {
+                                                                        "0".to_string()
+                                                                    };
+                                                                    if ui.add(
+                                                                        egui::TextEdit::singleline(&mut value_text)
+                                                                            .desired_width(50.0)
+                                                                    ).changed() {
+                                                                        if let Ok(v) = value_text.parse::<f64>() {
+                                                                            // Valid number
+                                                                            condition.right = SQLFilterComparisonValue::Number(v.to_string());
+                                                                        }
+                                                                        else {
+                                                                            // Invalid number, reset to 0
+                                                                            condition.right = SQLFilterComparisonValue::Number("0".to_string());
+                                                                        }
+                                                                    }
+                                                                }
+                                                                
+                                                            });
+
+                                                            //if cond_idx < group.len() - 1 {
+                                                            //    ui.label("OR");
+                                                            //}
+                                                        }
+
+                                                        // Remove conditions in reverse order
+                                                        for &idx in conditions_to_remove.iter().rev() {
+                                                            group.remove(idx);
+                                                        }
+                                                    });
+
+                                                    //if group_idx < curve.filter.conditions.len() - 1 {
+                                                    //    ui.label("AND");
+                                                    //}
+                                                }
+
+                                                // Remove groups in reverse order
+                                                for &idx in groups_to_remove.iter().rev() {
+                                                    curve.filter.conditions.remove(idx);
+                                                }
+
+                                                // Show current filter SQL
+                                                if !curve.filter.conditions.is_empty() {
+                                                    ui.label("Current filter:");
+                                                    ui.code(curve.filter.to_sql());
+                                                }
+                                            });
+
     
     
                                         //ui.label(format!("Selected: {}", self.selected));
@@ -288,6 +515,7 @@ impl eframe::App for MyApp {
                                             get_stat(&mut self.cache, &mut self.sql, &StatInput {
                                                 table: parquet_path.clone(),
                                                 column: curve.x_key.clone(),
+                                                filters: curve.filter.clone(),
                                         }),
                                     );
                                 });
@@ -398,6 +626,7 @@ struct HistogramInput {
 struct HistogramSubInput {
     id : usize,
     table : ParsedString,
+    filter : SQLFilter,
     x_key : ParsedString,
     value_type: HistogramAggregation,
     y_key : ParsedString,
@@ -483,9 +712,9 @@ fn compute_histogram(
 filtered_{} AS (
     SELECT *
     FROM {}
-    WHERE {} IS NOT NULL AND {} IS NOT NULL
+    WHERE ( {} IS NOT NULL AND {} IS NOT NULL ) {} 
 ),
-                "#,i, c.table.as_str(), c.x_key.as_str(), c.y_key.as_str()
+                "#,i, c.table.as_str(), c.x_key.as_str(), c.y_key.as_str(), c.filter.to_sql_and_prefix()
             ).as_str()
         );
 
@@ -517,7 +746,7 @@ hist_{} AS (
         joins.push_str(
             &format!(
                 r#"
-JOIN hist_{} AS h{} ON h{}.bucket = b.bucket
+LEFT JOIN hist_{} AS h{} ON h{}.bucket = b.bucket
                 "#, i, i, i
             ).as_str()
         );                
@@ -599,6 +828,7 @@ ORDER BY b.bucket
 struct StatInput {
     table : ParsedString,
     column : ParsedString,
+    filters : SQLFilter,
 }
 
 struct StatOutput {
@@ -646,6 +876,7 @@ fn compute_stat(
             MIN(t.{}) as min,
             MAX(t.{}) as max
         FROM {} AS t
+        {}
        "#,
         stat_input.column,
         stat_input.column,
@@ -653,7 +884,8 @@ fn compute_stat(
         stat_input.column,
         stat_input.column,
         stat_input.column,
-        stat_input.table 
+        stat_input.table ,
+        stat_input.filters.to_sql_where_prefix()
         ).as_str()
     )?.query_map(params![ ], |row| {
         Ok(StatOutput {

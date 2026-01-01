@@ -9,7 +9,7 @@ use egui_file_dialog::FileDialog;
 use strum::IntoEnumIterator;
 use strum_macros::{Display, EnumIter};
 
-use stattrak::StatTrack;
+use straptrack::StrapTrack;
 
 #[derive(Hash, Eq, PartialEq, Clone)]
 struct SQLFilter {
@@ -281,7 +281,7 @@ impl eframe::App for MyApp {
                                     let pp = format!("{}.parquet", file.to_string_lossy());
                                     let mut parquet_path = ParsedString::parse(&pp).ok();
                                     if let Some(_) = &parquet_path {
-                                        if let Some (st) = StatTrack::new(&file).ok() {
+                                        if let Some (st) = StrapTrack::new(&file).ok() {
                                             if let None = st.to_parquet(&pp).ok() {
                                                 // error converting to parquet
                                                 ui.label("Error converting to parquet");

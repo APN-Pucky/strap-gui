@@ -17,7 +17,7 @@ use parquet::file::properties::WriterProperties;
 
 /// Lazy/streaming parser for STRAP protocol files
 #[derive(Debug)]
-pub struct StatTrack {
+pub struct StrapTrack {
     file_path: PathBuf,
     //data : Vec<HashMap<String, f64>>,
 
@@ -26,11 +26,11 @@ pub struct StatTrack {
 }
 
 /// Iterator over STRAP file rows
-pub struct StatTrackIterator {
+pub struct StrapTrackIterator {
     reader: BufReader<File>,
 }
 
-impl Iterator for StatTrackIterator {
+impl Iterator for StrapTrackIterator {
     type Item = Result<HashMap<String, f64>, std::io::Error>;
     
     fn next(&mut self) -> Option<Self::Item> {
@@ -38,7 +38,7 @@ impl Iterator for StatTrackIterator {
         match self.reader.read_line(&mut line) {
             Ok(0) => None, // EOF
             Ok(_) => {
-                let parsed = StatTrack::parse_line(&line);
+                let parsed = StrapTrack::parse_line(&line);
                 Some(Ok(parsed))
             }
             Err(e) => Some(Err(e)),
@@ -46,7 +46,7 @@ impl Iterator for StatTrackIterator {
     }
 }
 
-impl StatTrack {
+impl StrapTrack {
     pub fn new(file_path: impl Into<PathBuf>) -> std::io::Result<Self> {
         let path = file_path.into();
         // Verify file exists
@@ -99,10 +99,10 @@ impl StatTrack {
     }
     
     /// Returns an iterator over all rows
-    pub fn iter(&self) -> Result<StatTrackIterator, std::io::Error> {
+    pub fn iter(&self) -> Result<StrapTrackIterator, std::io::Error> {
         let file = File::open(&self.file_path)?;
         let reader = BufReader::new(file);
-        Ok(StatTrackIterator { reader })
+        Ok(StrapTrackIterator { reader })
     }
     
     /// Stream through all rows with a callback

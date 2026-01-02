@@ -1,8 +1,7 @@
 use std::collections::HashMap;
-use std::hash::Hash;
 
 use std::fs::File;
-use std::io::{BufRead, BufReader, Seek, SeekFrom};
+use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 
 use std::sync::Arc;
@@ -75,15 +74,22 @@ impl StrapTrack {
     fn parse_line(line: &str) -> HashMap<String, f64> {
         let mut result = HashMap::new();
         let line = line.trim();
-        
-        // Handle @strap prefix
-        let line = if line.starts_with("@strap1 ") {
-            &line[8..]
-        } else if line.starts_with("@strap ") {
-            &line[7..]
+
+        // Handle @strap prefix - find first occurrence and continue from there
+        let line = if let Some(pos) = line.find("@strap") {
+            // Skip past "@strap" and any following digit/space
+            let after_strap = &line[pos..]; // Skip "@strap"
+            if let Some(pos) = after_strap.find(char::is_whitespace) {
+                &after_strap[pos..]
+            }
+            else {
+                after_strap
+            }
+            .trim_start() // Remove any leading whitespace
         } else {
             line
         };
+
         
         // Parse key-value pairs separated by whitespace
         let tokens: Vec<&str> = line.split_whitespace().collect();
@@ -147,44 +153,12 @@ impl StrapTrack {
         Ok(acc)
     }
 
-    pub fn to_unchunked_parquet(&self, filename: &str) -> Result<(), Box<dyn std::error::Error>> {
-
-
-        // 1. Collect all unique column names
-        let mut column_names = self.get_column_names()?;
-
-        column_names.sort(); // optional: deterministic column order
-
-        // 2. Build schema
-        let fields: Vec<Field> = column_names.iter()
-            .map(|name| Field::new(name, DataType::Float64, true)) // nullable = true
-            .collect();
-        let schema = Arc::new(Schema::new(fields));
-
-        // 3. Build arrays
-        let mut arrays: Vec<ArrayRef> = Vec::new();
-        for col in &column_names {
-            let values: Vec<Option<f64>> = self.iter()?
-                .map(|row| row.ok()?.get(col).copied())
-                .collect();
-            arrays.push(Arc::new(Float64Array::from(values)) as ArrayRef);
-        }
-
-
-        // 4. Build RecordBatch
-        let batch = RecordBatch::try_new(schema.clone(), arrays)?;
-
-        // Setup Parquet writer
-        let file = File::create(filename)?;
-        let props = WriterProperties::builder().build();
-        let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props))?;
-        writer.write(&batch)?;
-        writer.close()?;
-        println!("Sparse Parquet written!");
-        Ok(())
-    }
-
-    pub fn to_parquet(&self, filename: &str) -> Result<(), Box<dyn std::error::Error>> {
+    /// Convert STRAP data to Parquet format
+    pub fn to_parquet(
+        &self, 
+        filename: &str, 
+        chunk_size: usize,
+    ) -> Result<(), Box<dyn std::error::Error>> {
 
 
         // 1. Collect all unique column names
@@ -204,7 +178,7 @@ impl StrapTrack {
         let props = WriterProperties::builder().build();
         let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props))?;
 
-        for vhm in &self.iter()?.chunks(1000) {
+        for vhm in &self.iter()?.chunks(chunk_size) {
             let chunk_data: Result<Vec<_>, _> = vhm.collect();
             let chunk_data = chunk_data?;
             

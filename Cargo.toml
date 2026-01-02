@@ -10,9 +10,15 @@ path = "src/lib.rs"
 
 [[bin]]
 name = "strap-gui"
-path = "src/bin.rs"
+path = "src/gui.rs"
+
+[[bin]]
+name = "strap2parquet"
+path = "src/strap2parquet.rs"
 
 [dependencies]
+clap = "4.5.53"
+anyhow = "1.0"
 egui = "0.27"
 eframe = "0.27"
 egui_plot = "0.27"
@@ -24,3 +30,4 @@ parquet = "57.1.0"
 arrow = "57.1.0"
 itertools = "0.10"
 duckdb = { version = "=1.4.3", features = ["bundled", "parquet"] }
+tempfile = "3.24.0"

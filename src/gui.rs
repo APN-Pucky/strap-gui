@@ -1,10 +1,10 @@
 use core::panic;
-use std::{collections::HashMap, error::Error, fmt::{self, format}, ops::Deref, path::{Path, PathBuf}, time::Instant};
+use std::{collections::HashMap, fmt::{self}, ops::Deref};
 use std::fmt::{Display, Formatter, Result as FmtResult};
 
-use duckdb::{Connection, arrow::compute::kernels::coalesce, params};
+use duckdb::{Connection, params};
 use eframe::egui;
-use egui_plot::{Bar, BarChart, Legend, Line, Plot, PlotItem, PlotPoints, Polygon};
+use egui_plot::{Bar, BarChart, Legend, Plot};
 use egui_file_dialog::FileDialog;
 use strum::IntoEnumIterator;
 use strum_macros::{Display, EnumIter};
@@ -142,13 +142,13 @@ impl ParsedString {
     }
 }
 
-struct SQL {
+struct Sql {
     conn: duckdb::Connection,
     last_query: String,
     last_error: String,
 }
 
-impl SQL {
+impl Sql {
     fn prepare(&mut self, query: &str) -> duckdb::Result<duckdb::Statement> {
         self.last_query = query.to_string();
         self.conn.prepare(query)
@@ -161,17 +161,12 @@ enum Operation {
     Histogram,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, EnumIter, Display)]
-enum Aggregation {
-    Stat,
-}
-
 struct MyApp {
     operation: Operation,
     filedialog: FileDialog,
     cache : Cache,
 
-    sql : SQL,
+    sql : Sql,
 
 
     histogram_view : HistogramView,
@@ -179,21 +174,21 @@ struct MyApp {
 }
 
 struct HistogramView {
-    bin_scale: HistogramBinScale,
+    //bin_scale: HistogramBinScale,
     plot_settings : HistrogramPlotSettings,
     input : HistogramInput,
 }
 
 struct HistrogramPlotSettings {
-    x_axis_scale: HistogramAxisScale,
-    y_axis_scale: HistogramAxisScale,
+    //x_axis_scale: HistogramAxisScale,
+    //y_axis_scale: HistogramAxisScale,
 }
 
 
 impl Default for MyApp {
     fn default() -> Self {
         Self {
-            sql : SQL {
+            sql : Sql {
                 conn: Connection::open_in_memory().unwrap(),
                 last_query: "".to_string(),
                 last_error: "".to_string(),
@@ -207,14 +202,14 @@ impl Default for MyApp {
             },
             histogram_view : HistogramView {
                 plot_settings : HistrogramPlotSettings {
-                    x_axis_scale: HistogramAxisScale::Linear,
-                    y_axis_scale: HistogramAxisScale::Linear,
+                //    x_axis_scale: HistogramAxisScale::Linear,
+                //    y_axis_scale: HistogramAxisScale::Linear,
                 },
                 input : HistogramInput {
                     bins: 10,
                     curves : vec![],
                 },
-                bin_scale: HistogramBinScale::Linear,
+                //bin_scale: HistogramBinScale::Linear,
             },
             global_id_counter: 0,
         }
@@ -280,14 +275,13 @@ impl eframe::App for MyApp {
                                 if file.extension().and_then(|s| s.to_str()) != Some("parquet") {
                                     let pp = format!("{}.parquet", file.to_string_lossy());
                                     let mut parquet_path = ParsedString::parse(&pp).ok();
-                                    if let Some(_) = &parquet_path {
-                                        if let Some (st) = StrapTrack::new(&file).ok() {
-                                            if let None = st.to_parquet(&pp).ok() {
-                                                // error converting to parquet
-                                                ui.label("Error converting to parquet");
-                                                parquet_path = None
-                                            }
-                                        }
+                                    if parquet_path.is_some() 
+                                        && let Ok(st) = StrapTrack::new(&file)
+                                        && st.to_parquet(&pp, 1000).is_err()
+                                    {
+                                        // error converting to parquet
+                                        ui.label("Error converting to parquet");
+                                        parquet_path = None
                                     }
                                     parquet_path
                                 } else {
@@ -299,7 +293,7 @@ impl eframe::App for MyApp {
                                         ui.label("No columns found in file");
                                         return;
                                     }
-                                    let key = columns.get(0);
+                                    let key = columns.first();
                                     if let Some(key) = key {
                                         self.global_id_counter += 1;
                                         self.histogram_view.input.curves.push(HistogramSubInput {
@@ -341,10 +335,10 @@ impl eframe::App for MyApp {
                                     let filename = curve.table.as_str()
                                         .trim_matches('"')
                                         .split('/')
-                                        .last()
+                                        .next_back()
                                         .unwrap_or("unknown")
                                         .replace(".parquet", "");
-                                    ui.label(format!("{}", filename));
+                                    ui.label( filename.to_string());
 
                                         egui::ComboBox::new(format!("x_key_{}", curve.id) ,"X Key")
                                             .selected_text(curve.x_key.as_str())
@@ -366,7 +360,7 @@ impl eframe::App for MyApp {
                                             .selected_text(curve.value_type.to_string())
                                             .show_ui(ui, |ui| {
                                                 for name in HistogramAggregation::iter() {
-                                                    ui.selectable_value(&mut curve.value_type, name.clone(), name.to_string());
+                                                    ui.selectable_value(&mut curve.value_type, name, name.to_string());
                                                 }
                                         });
 
@@ -435,12 +429,12 @@ impl eframe::App for MyApp {
                                                                 if is_column {
                                                                     if let SQLFilterComparisonValue::Number(_) = condition.right {
                                                                         // Reset to first column if previously a number
-                                                                        condition.right = SQLFilterComparisonValue::Column(columns.get(0).cloned().unwrap_or(ParsedString::parse("0").unwrap()));
+                                                                        condition.right = SQLFilterComparisonValue::Column(columns.first().cloned().unwrap_or(ParsedString::parse("0").unwrap()));
                                                                     }
                                                                     // Column selection dropdown
                                                                     let current_col = match &condition.right {
                                                                         SQLFilterComparisonValue::Column(col) => col.as_str(),
-                                                                        SQLFilterComparisonValue::Number(_) => columns.get(0).map(|c| c.as_str()).unwrap_or(""),
+                                                                        SQLFilterComparisonValue::Number(_) => columns.first().map(|c| c.as_str()).unwrap_or(""),
                                                                     };
         
                                                                     egui::ComboBox::new(format!("right_col_{}_{}", group_idx, cond_idx),"")
@@ -559,7 +553,7 @@ impl eframe::App for MyApp {
     }
 }
 
-fn get_column_names<'a>(cache : &'a mut Cache, sql: &mut SQL, input : ColumnNamesInput) -> &'a Vec<ParsedString> {
+fn get_column_names<'a>(cache : &'a mut Cache, sql: &mut Sql, input : ColumnNamesInput) -> &'a Vec<ParsedString> {
     if ! cache.column_names.contains_key(&input) {
         match compute_column_names(sql, &input) {
             Ok(res) => {
@@ -580,7 +574,7 @@ fn get_column_names<'a>(cache : &'a mut Cache, sql: &mut SQL, input : ColumnName
 }
 
 fn compute_column_names(
-    sql: &mut SQL,
+    sql: &mut Sql,
     input : &ColumnNamesInput,
 ) -> duckdb::Result<ColumnNamesOutput> {
     let mut stmt = sql.prepare(
@@ -639,17 +633,17 @@ enum HistogramAggregation{
     Avg,
 }
 
-#[derive(Copy, Hash, Eq, PartialEq, Clone, Display,EnumIter)]
-enum HistogramAxisScale {
-    Linear,
-    //Log, // egui plot not supported yet: https://github.com/emilk/egui_plot/pull/29
-}
+//#[derive(Copy, Hash, Eq, PartialEq, Clone, Display,EnumIter)]
+//enum HistogramAxisScale {
+//    Linear,
+//    //Log, // egui plot not supported yet: https://github.com/emilk/egui_plot/pull/29
+//}
 
-#[derive(Copy, Hash, Eq, PartialEq, Clone, Display,EnumIter)]
-enum HistogramBinScale{
-    Linear,
-    //Log, // TODO SQL
-}
+//#[derive(Copy, Hash, Eq, PartialEq, Clone, Display,EnumIter)]
+//enum HistogramBinScale{
+//    Linear,
+//    //Log, // TODO SQL
+//}
 
 //#[derive(Hash, Eq, PartialEq, Clone, Display)]
 //enum HistorgramValueType {
@@ -667,9 +661,9 @@ struct HistogramOutput {
 }
 
 
-fn get_histogram<'a>(cache : &'a mut Cache, sql: &mut SQL, input : &'a HistogramInput) -> &'a HistogramOutput {
-    if !cache.histogram.contains_key(&input) {
-        match compute_histogram(sql, &input){
+fn get_histogram<'a>(cache : &'a mut Cache, sql: &mut Sql, input : &'a HistogramInput) -> &'a HistogramOutput {
+    if !cache.histogram.contains_key(input) {
+        match compute_histogram(sql, input){
             Ok(res) => {
                 cache.histogram.insert(input.clone(), res);
             },
@@ -679,7 +673,7 @@ fn get_histogram<'a>(cache : &'a mut Cache, sql: &mut SQL, input : &'a Histogram
             }
         }
     }
-    if let Some(res) = cache.histogram.get(&input) {
+    if let Some(res) = cache.histogram.get(input) {
         res
     }
     else {
@@ -688,7 +682,7 @@ fn get_histogram<'a>(cache : &'a mut Cache, sql: &mut SQL, input : &'a Histogram
 }
 
 fn compute_histogram(
-    sql: &mut SQL,
+    sql: &mut Sql,
     hist : &HistogramInput,
 ) -> duckdb::Result<HistogramOutput> {
     let mut filters:String= String::new();
@@ -707,7 +701,7 @@ fn compute_histogram(
             HistogramAggregation::Avg => format!("STDDEV({})", c.y_key),
         };
         filters.push_str(
-            &format!(
+            format!(
                 r#"
 filtered_{} AS (
     SELECT *
@@ -736,7 +730,7 @@ hist_{} AS (
             ).to_string()
         );
         coalesced.push_str(
-            &format!(
+            format!(
                 r#"
                 COALESCE(h{}.yvalue, 0) AS yvalue_{},
                 COALESCE(h{}.yerror, 0) AS yerror_{},
@@ -744,7 +738,7 @@ hist_{} AS (
             ).as_str()
         );
         joins.push_str(
-            &format!(
+            format!(
                 r#"
 LEFT JOIN hist_{} AS h{} ON h{}.bucket = b.bucket
                 "#, i, i, i
@@ -752,7 +746,7 @@ LEFT JOIN hist_{} AS h{} ON h{}.bucket = b.bucket
         );                
     }
     let x_keys = hist.curves.iter().map(|c| c.x_key.as_str()).collect::<Vec<_>>().join(", ");
-    let combined = hist.curves.iter().enumerate().map(|(i, c)| 
+    let combined = hist.curves.iter().enumerate().map(|(i, _c)| 
             format!(
                 r#"
 SELECT * FROM filtered_{}
@@ -840,9 +834,9 @@ struct StatOutput {
     max : f64,
 }
 
-fn get_stat<'a>(cache : &'a mut Cache, sql: &mut SQL, input: &StatInput) -> &'a StatOutput {
-    if !cache.stat.contains_key(&input) {
-        match compute_stat(sql, &input) {
+fn get_stat<'a>(cache : &'a mut Cache, sql: &mut Sql, input: &StatInput) -> &'a StatOutput {
+    if !cache.stat.contains_key(input) {
+        match compute_stat(sql, input) {
             Ok(res) => {
                 cache.stat.insert(input.clone(), res);
             },
@@ -852,7 +846,7 @@ fn get_stat<'a>(cache : &'a mut Cache, sql: &mut SQL, input: &StatInput) -> &'a 
             }
         }
     }
-    if let Some(res) = cache.stat.get(&input) {
+    if let Some(res) = cache.stat.get(input) {
         res
     }
     else {
@@ -861,7 +855,7 @@ fn get_stat<'a>(cache : &'a mut Cache, sql: &mut SQL, input: &StatInput) -> &'a 
 }
 
 fn compute_stat(
-    sql: &mut SQL,
+    sql: &mut Sql,
     stat_input : &StatInput,
 ) -> duckdb::Result<StatOutput> {
 
@@ -931,11 +925,11 @@ fn transpose<T: Clone>(matrix: Vec<Vec<T>>) -> Vec<Vec<T>> {
 
 fn draw_histogram<'a>(ui: &mut egui::Ui, 
                       cache : &'a mut Cache,
-                      sql: &mut SQL,
+                      sql: &mut Sql,
                       input : &'a HistogramInput,
                       plot_settings: &HistrogramPlotSettings,
     ) {
-    if (input.curves.is_empty()) {
+    if input.curves.is_empty() {
         ui.label("No histogram curves to display");
         return;
     }
@@ -953,11 +947,6 @@ fn draw_histogram<'a>(ui: &mut egui::Ui,
             )
         .collect());
 
-    let charts: Vec<BarChart> = bars.iter()
-        .map(|bar_group| 
-            BarChart::new(bar_group.clone())
-            .element_formatter(Box::new(|bar, _chart| bar.name.clone()))).collect();
-
     // add names
     let charts: Vec<BarChart> = bars.iter()
     .enumerate()
@@ -967,10 +956,11 @@ fn draw_histogram<'a>(ui: &mut egui::Ui,
         let filename = curve.table.as_str()
             .trim_matches('"')
             .split('/')
-            .last()
+            .next_back()
             .unwrap_or("unknown")
             .replace(".parquet", "");
-        let legend_name = format!("{} of {} vs {} ({})", 
+        let legend_name = format!("{}. {} of {} vs {} ({})", 
+                                 i + 1,
                                  curve.value_type, 
                                  curve.y_key.as_str().trim_matches('"'), 
                                  curve.x_key.as_str().trim_matches('"'),

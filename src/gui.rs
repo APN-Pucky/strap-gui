@@ -82,12 +82,12 @@ impl SQLFilterComparison {
 
 #[derive(Hash, Eq, PartialEq, Clone, EnumIter)]
 enum SQLFilterComparisonOperation {
-    Equal,
-    NotEqual,
     GreaterThan,
     LessThan,
     GreaterThanOrEqual,
     LessThanOrEqual,
+    Equal,
+    NotEqual,
 }
 
 impl fmt::Display for SQLFilterComparisonOperation {

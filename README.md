@@ -1,5 +1,3 @@
-# StatTrak
+# STRAP GUI
 
-Simple statistics accumulators.
-
-Somewhat analougus to `metrics`, but without macros or Arc.
+Simple statistics tracking protocol (STRAP) visualizer.

@@ -24,7 +24,9 @@ impl SQLFilter {
     }
 
     fn to_sql(&self) -> String {
-        self.conditions.iter().map(|group| {
+        self.conditions.iter()
+        .filter(|group| !group.is_empty())
+        .map(|group| {
             "(".to_string()
             + group.iter().map(|c| c.to_sql()).collect::<Vec<_>>().join(" OR ").as_str()
             + ")"

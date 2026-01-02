@@ -17,18 +17,10 @@ use parquet::file::properties::WriterProperties;
 use zip::ZipArchive;
 use zstd::stream::read::Decoder as ZstdDecoder;
 
-/// Lazy/streaming parser for STRAP protocol files
-#[derive(Debug)]
-pub struct StrapTrack {
-    file_path: PathBuf,
-    //data : Vec<HashMap<String, f64>>,
-
-    //cached_column_names: Option<Vec<String>>,
-    //cached_columns: HashMap<String, Vec<f64>>,
-}
 
 /// Iterator over STRAP file rows
 pub struct StrapTrackIterator {
+    all:bool,
     reader: Box<dyn BufRead>,
 }
 
@@ -40,12 +32,22 @@ impl Iterator for StrapTrackIterator {
         match self.reader.read_line(&mut line) {
             Ok(0) => None, // EOF
             Ok(_) => {
-                let parsed = StrapTrack::parse_line(&line);
+                let parsed = StrapTrack::parse_line(&line,self.all);
                 Some(Ok(parsed))
             }
             Err(e) => Some(Err(e)),
         }
     }
+}
+
+/// Lazy/streaming parser for STRAP protocol files
+#[derive(Debug)]
+pub struct StrapTrack {
+    file_path: PathBuf,
+    //data : Vec<HashMap<String, f64>>,
+
+    //cached_column_names: Option<Vec<String>>,
+    //cached_columns: HashMap<String, Vec<f64>>,
 }
 
 impl StrapTrack {
@@ -112,7 +114,7 @@ impl StrapTrack {
 
     
     /// Parse a single STRAP line into key-value pairs
-    fn parse_line(line: &str) -> HashMap<String, f64> {
+    fn parse_line(line: &str, all : bool) -> HashMap<String, f64> {
         let mut result = HashMap::new();
         let line = line.trim();
 
@@ -128,7 +130,11 @@ impl StrapTrack {
             }
             .trim_start() // Remove any leading whitespace
         } else {
-            line
+            if all {
+                line
+            } else {
+                return result; // Empty
+            }
         };
 
         
@@ -147,8 +153,16 @@ impl StrapTrack {
     
     /// Returns an iterator over all rows
     pub fn iter(&self) -> Result<StrapTrackIterator, std::io::Error> {
+        // check if file name contains .strap or .strap.gz etc
+        let path_str = self.file_path.to_string_lossy().to_lowercase();
+        let all = path_str.ends_with(".strap") 
+            || path_str.ends_with(".strap.gz") 
+            || path_str.ends_with(".strap.gzip")
+            || path_str.ends_with(".strap.zst")
+            || path_str.ends_with(".strap.zstd")
+            || path_str.ends_with(".strap.zip");
         let reader = self.create_reader()?;
-        Ok(StrapTrackIterator { reader })
+        Ok(StrapTrackIterator { all, reader })
     }
     
     /// Stream through all rows with a callback
@@ -250,35 +264,43 @@ mod tests {
     use std::io::Write;
     use tempfile::NamedTempFile;
 
-    fn create_test_file(content: &str) -> NamedTempFile {
-        let mut file = NamedTempFile::new().unwrap();
+    fn create_test_file(suffix: &str, content: &str) -> NamedTempFile {
+        let mut file = NamedTempFile::with_suffix(suffix).unwrap();
         write!(file, "{}", content).unwrap();
         file
     }
 
     #[test]
     fn test_parse_simple_line() {
-        let result = StrapTrack::parse_line("alice_sword 2.2 bob_bow 5.0");
+        let result = StrapTrack::parse_line("alice_sword 2.2 bob_bow 5.0", true);
         assert_eq!(result.get("alice_sword"), Some(&2.2));
         assert_eq!(result.get("bob_bow"), Some(&5.0));
+        let result = StrapTrack::parse_line("alice_sword 2.2 bob_bow 5.0", false);
+        // assert empty since no @strap prefix
+        assert!(result.is_empty());
     }
 
     #[test]
     fn test_parse_strap_prefix() {
-        let result = StrapTrack::parse_line("@strap damage 15.0 attacker_alice 1.0");
+        let result = StrapTrack::parse_line("@strap damage 15.0 attacker_alice 1.0", true);
+        assert_eq!(result.get("damage"), Some(&15.0));
+        assert_eq!(result.get("attacker_alice"), Some(&1.0));
+        let result = StrapTrack::parse_line("@strap damage 15.0 attacker_alice 1.0", false);
         assert_eq!(result.get("damage"), Some(&15.0));
         assert_eq!(result.get("attacker_alice"), Some(&1.0));
     }
 
     #[test]
     fn test_parse_strap1_prefix() {
-        let result = StrapTrack::parse_line("@strap1 line 5.0");
+        let result = StrapTrack::parse_line("@strap1 line 5.0", true);
+        assert_eq!(result.get("line"), Some(&5.0));
+        let result = StrapTrack::parse_line("@strap1 line 5.0", false);
         assert_eq!(result.get("line"), Some(&5.0));
     }
 
     #[test]
     fn test_parse_strap_with_metadata() {
-        let result = StrapTrack::parse_line("DATE TIME OR OTHER_METADATA @strap damage 15.0 attacker_alice 1.0 defender_bob 1.0");
+        let result = StrapTrack::parse_line("DATE TIME OR OTHER_METADATA @strap damage 15.0 attacker_alice 1.0 defender_bob 1.0", false);
         assert_eq!(result.get("damage"), Some(&15.0));
         assert_eq!(result.get("attacker_alice"), Some(&1.0));
         assert_eq!(result.get("defender_bob"), Some(&1.0));
@@ -286,34 +308,38 @@ mod tests {
 
     #[test]
     fn test_parse_empty_line() {
-        let result = StrapTrack::parse_line("");
+        let result = StrapTrack::parse_line("", true);
         assert!(result.is_empty());
     }
 
     #[test]
     fn test_parse_whitespace_only() {
-        let result = StrapTrack::parse_line("   \t  ");
+        let result = StrapTrack::parse_line("   \t  ",true);
         assert!(result.is_empty());
     }
 
     #[test]
     fn test_parse_odd_number_tokens() {
-        let result = StrapTrack::parse_line("key1 1.0 key2");
+        let result = StrapTrack::parse_line("key1 1.0 key2",true);
         assert_eq!(result.get("key1"), Some(&1.0));
         assert!(!result.contains_key("key2"));
+        let result = StrapTrack::parse_line("key1 1.0 key2",false);
+        assert!(result.is_empty());
     }
 
     #[test]
     fn test_parse_invalid_float() {
-        let result = StrapTrack::parse_line("key1 invalid_float key2 2.0");
+        let result = StrapTrack::parse_line("key1 invalid_float key2 2.0", true);
         assert!(!result.contains_key("key1"));
         assert_eq!(result.get("key2"), Some(&2.0));
+        let result = StrapTrack::parse_line("key1 invalid_float key2 2.0", false);
+        assert!(result.is_empty());
     }
 
     #[test]
     fn test_iterator() {
         let content = "alice_sword 2.2 bob_bow 5.0\ndamage 2.0 attacker_alice 1.0\n";
-        let file = create_test_file(content);
+        let file = create_test_file(".strap", content);
         let track = StrapTrack::new(file.path()).unwrap();
         
         let rows: Result<Vec<_>, _> = track.iter().unwrap().collect();
@@ -327,7 +353,7 @@ mod tests {
     #[test]
     fn test_get_column_names() {
         let content = "a 1.0 b 2.0\nc 3.0 d 4.0\na 5.0 e 6.0\n";
-        let file = create_test_file(content);
+        let file = create_test_file(".strap", content);
         let track = StrapTrack::new(file.path()).unwrap();
         
         let mut columns = track.get_column_names().unwrap();
@@ -339,7 +365,7 @@ mod tests {
     #[test]
     fn test_filter_rows() {
         let content = "type 1.0 value 10.0\ntype 2.0 value 20.0\ntype 1.0 value 15.0\n";
-        let file = create_test_file(content);
+        let file = create_test_file(".strap", content);
         let track = StrapTrack::new(file.path()).unwrap();
         
         let filtered = track.filter_rows(|row| {
@@ -353,8 +379,8 @@ mod tests {
 
     #[test]
     fn test_aggregate() {
-        let content = "value 10.0\nvalue 20.0\nvalue 15.0\n";
-        let file = create_test_file(content);
+        let content = "@strap value 10.0\n@strap value 20.0\n@strap value 15.0\n";
+        let file = create_test_file(".log", content);
         let track = StrapTrack::new(file.path()).unwrap();
         
         let sum = track.aggregate(0.0, |acc, row| {
@@ -367,7 +393,7 @@ mod tests {
     #[test]
     fn test_mixed_strap_formats() {
         let content = "@strap a 1.0\n@strap1 b 2.0\nNOISE @strap c 3.0\nregular 4.0\n";
-        let file = create_test_file(content);
+        let file = create_test_file(".strap", content);
         let track = StrapTrack::new(file.path()).unwrap();
         
         let rows: Result<Vec<_>, _> = track.iter().unwrap().collect();
@@ -382,20 +408,20 @@ mod tests {
 
     #[test]
     fn test_strap_with_digits() {
-        let result = StrapTrack::parse_line("@strap2 key 1.0");
+        let result = StrapTrack::parse_line("@strap2 key 1.0", false);
         assert_eq!(result.get("key"), Some(&1.0));
     }
 
     #[test]
     fn test_scientific_notation() {
-        let result = StrapTrack::parse_line("temp 3.14e2 pressure 1.01e5");
+        let result = StrapTrack::parse_line("temp 3.14e2 pressure 1.01e5", true);
         assert_eq!(result.get("temp"), Some(&314.0));
         assert_eq!(result.get("pressure"), Some(&101000.0));
     }
 
     #[test]
     fn test_negative_values() {
-        let result = StrapTrack::parse_line("deficit -42.5 surplus 100.0");
+        let result = StrapTrack::parse_line("deficit -42.5 surplus 100.0", true);
         assert_eq!(result.get("deficit"), Some(&-42.5));
         assert_eq!(result.get("surplus"), Some(&100.0));
     }

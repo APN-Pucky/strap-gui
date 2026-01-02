@@ -12,10 +12,6 @@ path = "src/lib.rs"
 name = "strap-gui"
 path = "src/gui.rs"
 
-[[bin]]
-name = "strap2parquet"
-path = "src/strap2parquet.rs"
-
 [dependencies]
 clap = "4.5.53"
 anyhow = "1.0"

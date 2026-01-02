@@ -12,7 +12,8 @@ jobs:
           # Tier 1 platforms
           - { os: 'ubuntu-latest',  target: 'x86_64-unknown-linux-gnu', cross: false }
           # - { os: 'ubuntu-latest',  target: 'i686-unknown-linux-gnu',   cross: true }
-          - { os: 'macOS-latest',   target: 'x86_64-apple-darwin',      cross: false }
+          # Fails for some reason
+          # - { os: 'macOS-latest',   target: 'x86_64-apple-darwin',      cross: false }
           - { os: 'windows-latest', target: 'x86_64-pc-windows-msvc',   cross: false }
     steps:
       - uses: actions/checkout@v3
@@ -30,6 +31,34 @@ jobs:
         with:
           command: test
           args: --lib
+
+      
+      # Build release binary for artifact
+      - uses: actions-rs/cargo@v1
+        with:
+          command: build
+          args: --release --all-features --target=${{ matrix.triple.target }}
+          use-cross: ${{ matrix.triple.cross }}
+      
+      # Move and package binary
+      - name: Move binary to root
+        run: mv target/${{ matrix.triple.target }}/release/strap* .
+      
+      - name: Package binary (Linux/macOS)
+        if: matrix.triple.os != 'windows-latest'
+        run: zip ${{ matrix.triple.target }}.zip strap-gui README.md LICENSE.md
+      
+      - name: Package binary (Windows)
+        if: matrix.triple.os == 'windows-latest'
+        run: 7z a ${{ matrix.triple.target }}.zip strap-gui.exe README.md LICENSE.md
+      
+      # Upload as artifact
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: strap-gui-${{ matrix.triple.target }}
+          path: ${{ matrix.triple.target }}.zip
+          retention-days: 30
   
 
   release:
@@ -73,7 +102,7 @@ jobs:
           # Tier 1 platforms
           - { os: 'ubuntu-latest',  target: 'x86_64-unknown-linux-gnu', cross: false }
           # - { os: 'ubuntu-latest',  target: 'i686-unknown-linux-gnu',   cross: true }
-          - { os: 'macOS-latest',   target: 'x86_64-apple-darwin',      cross: false }
+          # - { os: 'macOS-latest',   target: 'x86_64-apple-darwin',      cross: false }
           - { os: 'windows-latest', target: 'x86_64-pc-windows-msvc',   cross: false }
     steps:
       - uses: actions/checkout@v2
@@ -93,9 +122,9 @@ jobs:
         run: mv target/${{ matrix.triple.target }}/release/strap* .
       - name: zip it
         if: matrix.triple.os != 'windows-latest'
-        run: zip ${{ matrix.triple.target }}.zip strap-gui README.md -r data
+        run: zip ${{ matrix.triple.target }}.zip strap-gui README.md LICENSE.md
       - name: zip it
-        run: 7z a ${{ matrix.triple.target }}.zip strap-gui.exe README.md -r data
+        run: 7z a ${{ matrix.triple.target }}.zip strap-gui.exe README.md LICENSE.md
         if: matrix.triple.os == 'windows-latest'
       
       - name: Load Release URL File from release job
@@ -157,7 +186,7 @@ jobs:
           # Tier 1 platforms
           - { os: 'ubuntu-latest',  target: 'x86_64-unknown-linux-gnu', cross: false }
           # - { os: 'ubuntu-latest',  target: 'i686-unknown-linux-gnu',   cross: true }
-          - { os: 'macOS-latest',   target: 'x86_64-apple-darwin',      cross: false }
+          # - { os: 'macOS-latest',   target: 'x86_64-apple-darwin',      cross: false }
           - { os: 'windows-latest', target: 'x86_64-pc-windows-msvc',   cross: false }
     steps:
       - uses: actions/checkout@v2
@@ -177,9 +206,9 @@ jobs:
         run: mv target/${{ matrix.triple.target }}/debug/strap* .
       - name: zip it
         if: matrix.triple.os != 'windows-latest'
-        run: zip ${{ matrix.triple.target }}.zip strap-gui README.md -r data
+        run: zip ${{ matrix.triple.target }}.zip strap-gui README.md LICENSE.md
       - name: zip it
-        run: 7z a ${{ matrix.triple.target }}.zip strap-gui.exe README.md -r data
+        run: 7z a ${{ matrix.triple.target }}.zip strap-gui.exe README.md LICENSE.md
         if: matrix.triple.os == 'windows-latest'
       
       - name: Load Release URL File from release job

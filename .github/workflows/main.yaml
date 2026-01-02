@@ -32,7 +32,26 @@ jobs:
           command: test
           args: --lib
 
-      
+  snapshot:
+    name:  ${{ matrix.triple.target }}
+    runs-on: ${{ matrix.triple.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        triple:
+          # Tier 1 platforms
+          - { os: 'ubuntu-latest',  target: 'x86_64-unknown-linux-gnu', cross: false }
+          # - { os: 'ubuntu-latest',  target: 'i686-unknown-linux-gnu',   cross: true }
+          # Fails for some reason
+          # - { os: 'macOS-latest',   target: 'x86_64-apple-darwin',      cross: false }
+          - { os: 'windows-latest', target: 'x86_64-pc-windows-msvc',   cross: false }
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          submodules: false
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable      
       # Build release binary for artifact
       - uses: actions-rs/cargo@v1
         with:

@@ -1,9 +1,10 @@
-use core::panic;
+use core::{hash, panic};
 use std::{collections::HashMap, fmt::{self}, ops::Deref};
 use std::fmt::{Display, Formatter, Result as FmtResult};
 
 use duckdb::{Connection, params};
 use eframe::egui;
+use egui::RichText;
 use egui_plot::{Bar, BarChart, Legend, Plot};
 use egui_file_dialog::FileDialog;
 use strum::IntoEnumIterator;
@@ -82,12 +83,12 @@ impl SQLFilterComparison {
 
 #[derive(Hash, Eq, PartialEq, Clone, EnumIter)]
 enum SQLFilterComparisonOperation {
+    Equal,
+    NotEqual,
     GreaterThan,
     LessThan,
     GreaterThanOrEqual,
     LessThanOrEqual,
-    Equal,
-    NotEqual,
 }
 
 impl fmt::Display for SQLFilterComparisonOperation {
@@ -146,13 +147,15 @@ impl ParsedString {
 
 struct Sql {
     conn: duckdb::Connection,
-    last_query: String,
-    last_error: String,
+    // request + error
+    history : Vec<(String, Option<String>)>,
+    //last_query: String,
+    //last_error: String,
 }
 
 impl Sql {
     fn prepare(&mut self, query: &str) -> duckdb::Result<duckdb::Statement> {
-        self.last_query = query.to_string();
+        //self.last_query = query.to_string();
         self.conn.prepare(query)
     }
 }
@@ -178,7 +181,11 @@ struct MyApp {
 struct HistogramView {
     //bin_scale: HistogramBinScale,
     plot_settings : HistrogramPlotSettings,
+    auto_update: bool,
+    update: bool,
     input : HistogramInput,
+    stat : Option<StatOutput>,
+    histogram : Option<HistogramOutput>,
 }
 
 struct HistrogramPlotSettings {
@@ -192,8 +199,7 @@ impl Default for MyApp {
         Self {
             sql : Sql {
                 conn: Connection::open_in_memory().unwrap(),
-                last_query: "".to_string(),
-                last_error: "".to_string(),
+                history : vec![],
             },
             filedialog: FileDialog::new(),
             operation: Operation::Histogram,
@@ -207,10 +213,14 @@ impl Default for MyApp {
                 //    x_axis_scale: HistogramAxisScale::Linear,
                 //    y_axis_scale: HistogramAxisScale::Linear,
                 },
+                auto_update: true,
+                update: false,
                 input : HistogramInput {
                     bins: 10,
                     curves : vec![],
                 },
+                stat : None,
+                histogram : None,
                 //bin_scale: HistogramBinScale::Linear,
             },
             global_id_counter: 0,
@@ -265,6 +275,19 @@ impl eframe::App for MyApp {
                         if ui.button("Add Histogram").clicked() {
                             self.filedialog.select_file();
                         };
+
+                        ui.vertical(|ui| {
+                            ui.checkbox(&mut self.histogram_view.auto_update, "Auto Update");
+                            if !self.histogram_view.auto_update {
+                                if ui.button("Update").clicked() {
+                                    self.histogram_view.update = true;
+                                }
+                            }
+                            else {
+                                self.histogram_view.update = true;
+                            }
+                        });
+
 
                         // Update the dialog
                         self.filedialog.update(ctx);
@@ -342,178 +365,183 @@ impl eframe::App for MyApp {
                                         .replace(".parquet", "");
                                     ui.label( filename.to_string());
 
-                                        egui::ComboBox::new(format!("x_key_{}", curve.id) ,"X Key")
-                                            .selected_text(curve.x_key.as_str())
-                                            .show_ui(ui, |ui| {
-                                                for name in columns {
-                                                    ui.selectable_value(&mut curve.x_key, name.clone(), name.as_str());
-                                                }
-                                        });
+                                    egui::ComboBox::new(format!("x_key_{}", curve.id) ,"X Key")
+                                        .selected_text(curve.x_key.as_str())
+                                        .show_ui(ui, |ui| {
+                                            for name in columns {
+                                                ui.selectable_value(&mut curve.x_key, name.clone(), name.as_str());
+                                            }
+                                    });
 
-                                        egui::ComboBox::new(format!("y_key_{}", curve.id) ,"Y Key")
-                                            .selected_text(curve.y_key.as_str())
-                                            .show_ui(ui, |ui| {
-                                                for name in columns {
-                                                    ui.selectable_value(&mut curve.y_key, name.clone(), name.as_str());
-                                                }
-                                        });
+                                    egui::ComboBox::new(format!("y_key_{}", curve.id) ,"Y Key")
+                                        .selected_text(curve.y_key.as_str())
+                                        .show_ui(ui, |ui| {
+                                            for name in columns {
+                                                ui.selectable_value(&mut curve.y_key, name.clone(), name.as_str());
+                                            }
+                                    });
 
-                                        egui::ComboBox::new(format!("type_{}", curve.id),"Type")
-                                            .selected_text(curve.value_type.to_string())
-                                            .show_ui(ui, |ui| {
-                                                for name in HistogramAggregation::iter() {
-                                                    ui.selectable_value(&mut curve.value_type, name, name.to_string());
-                                                }
-                                        });
+                                    egui::ComboBox::new(format!("type_{}", curve.id),"Type")
+                                        .selected_text(curve.value_type.to_string())
+                                        .show_ui(ui, |ui| {
+                                            for name in HistogramAggregation::iter() {
+                                                ui.selectable_value(&mut curve.value_type, name, name.to_string());
+                                            }
+                                    });
 
-                                        // Add expandable filter section
-                                        egui::CollapsingHeader::new("Filters")
-                                            .id_source(format!("filters_{}", curve.id))
-                                            .default_open(true)
-                                            .show(ui, |ui| {
-                                                // Add new filter group button
-                                                if ui.button("Add Filter Group").clicked() {
-                                                    curve.filter.conditions.push(vec![]);
-                                                }
+                                    // Add expandable filter section
+                                    egui::CollapsingHeader::new("Filters")
+                                        .id_source(format!("filters_{}", curve.id))
+                                        .default_open(true)
+                                        .show(ui, |ui| {
+                                            // Add new filter group button
+                                            if ui.button("Add Filter Group").clicked() {
+                                                curve.filter.conditions.push(vec![]);
+                                            }
 
-                                                let mut groups_to_remove = Vec::new();
+                                            let mut groups_to_remove = Vec::new();
 
-                                                for (group_idx, group) in curve.filter.conditions.iter_mut().enumerate() {
-                                                    ui.horizontal(|ui| {
-                                                        ui.label(format!("OR Group {}", group_idx + 1));
-                                                        if ui.button("Remove Group").clicked() {
-                                                            groups_to_remove.push(group_idx);
-                                                        }
-                                                    });
+                                            for (group_idx, group) in curve.filter.conditions.iter_mut().enumerate() {
+                                                ui.horizontal(|ui| {
+                                                    ui.label(format!("OR Group {}", group_idx + 1));
+                                                    if ui.button("Remove Group").clicked() {
+                                                        groups_to_remove.push(group_idx);
+                                                    }
+                                                });
 
-                                                    ui.indent(format!("group_{}", group_idx), |ui| {
-                                                        // Add condition to group button
-                                                        if ui.button("Add Condition").clicked() {
-                                                            group.push(SQLFilterComparison {
-                                                                left: SQLFilterComparisonValue::Number("0".to_string()),
-                                                                comparison: SQLFilterComparisonOperation::Equal,
-                                                                right: SQLFilterComparisonValue::Number("0".to_string()),
-                                                            });
-                                                        }
+                                                ui.indent(format!("group_{}", group_idx), |ui| {
+                                                    // Add condition to group button
+                                                    if ui.button("Add Condition").clicked() {
+                                                        group.push(SQLFilterComparison {
+                                                            left: SQLFilterComparisonValue::Number("0".to_string()),
+                                                            comparison: SQLFilterComparisonOperation::GreaterThan,
+                                                            right: SQLFilterComparisonValue::Number("0".to_string()),
+                                                        });
+                                                    }
 
-                                                        let mut conditions_to_remove = Vec::new();
+                                                    let mut conditions_to_remove = Vec::new();
 
-                                                        for (cond_idx, condition) in group.iter_mut().enumerate() {
-                                                            ui.horizontal(|ui| {
+                                                    for (cond_idx, condition) in group.iter_mut().enumerate() {
+                                                        ui.horizontal(|ui| {
 
-                                                                if ui.small_button("x").clicked() {
-                                                                    conditions_to_remove.push(cond_idx);
+                                                            if ui.small_button("x").clicked() {
+                                                                conditions_to_remove.push(cond_idx);
+                                                            }
+
+                                                            let mut is_column = matches!(condition.right, SQLFilterComparisonValue::Column(_));
+
+                                                            ui.checkbox(&mut is_column, "Column");
+
+
+                                                            // Left side (column selection)
+                                                            egui::ComboBox::new(format!("left_{}_{}", group_idx, cond_idx), "")
+                                                                .selected_text(condition.left.to_string())
+                                                                .show_ui(ui, |ui| {
+                                                                    for col in columns {
+                                                                        ui.selectable_value(&mut condition.left, SQLFilterComparisonValue::Column(col.clone()), col.as_str());
+                                                                    }
+                                                                });
+                                                            
+                                                            // Comparison operator
+                                                            egui::ComboBox::new(format!("op_{}_{}", group_idx, cond_idx), "")
+                                                                .selected_text(condition.comparison.to_string())
+                                                                .show_ui(ui, |ui| {
+                                                                    for op in SQLFilterComparisonOperation::iter() {
+                                                                        ui.selectable_value(&mut condition.comparison, op.clone(), op.to_string());
+                                                                    }
+                                                                });
+
+                                                            if is_column {
+                                                                if let SQLFilterComparisonValue::Number(_) = condition.right {
+                                                                    // Reset to first column if previously a number
+                                                                    condition.right = SQLFilterComparisonValue::Column(columns.first().cloned().unwrap_or(ParsedString::parse("0").unwrap()));
                                                                 }
-
-                                                                let mut is_column = matches!(condition.right, SQLFilterComparisonValue::Column(_));
-
-                                                                ui.checkbox(&mut is_column, "Column");
-
-
-                                                                // Left side (column selection)
-                                                                egui::ComboBox::new(format!("left_{}_{}", group_idx, cond_idx), "")
-                                                                    .selected_text(condition.left.to_string())
+                                                                // Column selection dropdown
+                                                                let current_col = match &condition.right {
+                                                                    SQLFilterComparisonValue::Column(col) => col.as_str(),
+                                                                    SQLFilterComparisonValue::Number(_) => columns.first().map(|c| c.as_str()).unwrap_or(""),
+                                                                };
+        
+                                                                egui::ComboBox::new(format!("right_col_{}_{}", group_idx, cond_idx),"")
+                                                                    .selected_text(current_col)
                                                                     .show_ui(ui, |ui| {
                                                                         for col in columns {
-                                                                            ui.selectable_value(&mut condition.left, SQLFilterComparisonValue::Column(col.clone()), col.as_str());
+                                                                            ui.selectable_value(&mut condition.right, SQLFilterComparisonValue::Column(col.clone()), col.as_str());
                                                                         }
                                                                     });
-                                                                
-                                                                // Comparison operator
-                                                                egui::ComboBox::new(format!("op_{}_{}", group_idx, cond_idx), "")
-                                                                    .selected_text(condition.comparison.to_string())
-                                                                    .show_ui(ui, |ui| {
-                                                                        for op in SQLFilterComparisonOperation::iter() {
-                                                                            ui.selectable_value(&mut condition.comparison, op.clone(), op.to_string());
-                                                                        }
-                                                                    });
-
-                                                                if is_column {
-                                                                    if let SQLFilterComparisonValue::Number(_) = condition.right {
-                                                                        // Reset to first column if previously a number
-                                                                        condition.right = SQLFilterComparisonValue::Column(columns.first().cloned().unwrap_or(ParsedString::parse("0").unwrap()));
-                                                                    }
-                                                                    // Column selection dropdown
-                                                                    let current_col = match &condition.right {
-                                                                        SQLFilterComparisonValue::Column(col) => col.as_str(),
-                                                                        SQLFilterComparisonValue::Number(_) => columns.first().map(|c| c.as_str()).unwrap_or(""),
-                                                                    };
-        
-                                                                    egui::ComboBox::new(format!("right_col_{}_{}", group_idx, cond_idx),"")
-                                                                        .selected_text(current_col)
-                                                                        .show_ui(ui, |ui| {
-                                                                            for col in columns {
-                                                                                ui.selectable_value(&mut condition.right, SQLFilterComparisonValue::Column(col.clone()), col.as_str());
-                                                                            }
-                                                                        });
+                                                            }
+                                                            else {
+                                                                if let SQLFilterComparisonValue::Column(_) = condition.right {
+                                                                    // Reset to 0 if previously a column
+                                                                    condition.right = SQLFilterComparisonValue::Number("0".to_string());
                                                                 }
-                                                                else {
-                                                                    if let SQLFilterComparisonValue::Column(_) = condition.right {
-                                                                        // Reset to 0 if previously a column
+                                                                // Right side is a number
+                                                                let mut value_text = if let SQLFilterComparisonValue::Number(ref num) = condition.right {
+                                                                    num.clone()
+                                                                } else {
+                                                                    "0".to_string()
+                                                                };
+                                                                if ui.add(
+                                                                    egui::TextEdit::singleline(&mut value_text)
+                                                                        .desired_width(50.0)
+                                                                ).changed() {
+                                                                    if let Ok(v) = value_text.parse::<f64>() {
+                                                                        // Valid number
+                                                                        condition.right = SQLFilterComparisonValue::Number(v.to_string());
+                                                                    }
+                                                                    else {
+                                                                        // Invalid number, reset to 0
                                                                         condition.right = SQLFilterComparisonValue::Number("0".to_string());
                                                                     }
-                                                                    // Right side is a number
-                                                                    let mut value_text = if let SQLFilterComparisonValue::Number(ref num) = condition.right {
-                                                                        num.clone()
-                                                                    } else {
-                                                                        "0".to_string()
-                                                                    };
-                                                                    if ui.add(
-                                                                        egui::TextEdit::singleline(&mut value_text)
-                                                                            .desired_width(50.0)
-                                                                    ).changed() {
-                                                                        if let Ok(v) = value_text.parse::<f64>() {
-                                                                            // Valid number
-                                                                            condition.right = SQLFilterComparisonValue::Number(v.to_string());
-                                                                        }
-                                                                        else {
-                                                                            // Invalid number, reset to 0
-                                                                            condition.right = SQLFilterComparisonValue::Number("0".to_string());
-                                                                        }
-                                                                    }
                                                                 }
-                                                                
-                                                            });
+                                                            }
+                                                            
+                                                        });
 
-                                                            //if cond_idx < group.len() - 1 {
-                                                            //    ui.label("OR");
-                                                            //}
-                                                        }
+                                                        //if cond_idx < group.len() - 1 {
+                                                        //    ui.label("OR");
+                                                        //}
+                                                    }
 
-                                                        // Remove conditions in reverse order
-                                                        for &idx in conditions_to_remove.iter().rev() {
-                                                            group.remove(idx);
-                                                        }
-                                                    });
+                                                    // Remove conditions in reverse order
+                                                    for &idx in conditions_to_remove.iter().rev() {
+                                                        group.remove(idx);
+                                                    }
+                                                });
 
-                                                    //if group_idx < curve.filter.conditions.len() - 1 {
-                                                    //    ui.label("AND");
-                                                    //}
-                                                }
+                                                //if group_idx < curve.filter.conditions.len() - 1 {
+                                                //    ui.label("AND");
+                                                //}
+                                            }
 
-                                                // Remove groups in reverse order
-                                                for &idx in groups_to_remove.iter().rev() {
-                                                    curve.filter.conditions.remove(idx);
-                                                }
+                                            // Remove groups in reverse order
+                                            for &idx in groups_to_remove.iter().rev() {
+                                                curve.filter.conditions.remove(idx);
+                                            }
 
-                                                // Show current filter SQL
-                                                if !curve.filter.conditions.is_empty() {
-                                                    ui.label("Current filter:");
-                                                    ui.code(curve.filter.to_sql());
-                                                }
-                                            });
+                                            // Show current filter SQL
+                                            if !curve.filter.conditions.is_empty() {
+                                                ui.label("Current filter:");
+                                                ui.code(curve.filter.to_sql());
+                                            }
+                                        });
 
     
     
-                                        //ui.label(format!("Selected: {}", self.selected));
-                                        draw_stat(
-                                            ui,
-                                            get_stat(&mut self.cache, &mut self.sql, &StatInput {
+                                    //ui.label(format!("Selected: {}", self.selected));
+                                    if self.histogram_view.update {
+                                        self.histogram_view.stat = Some(get_stat(&mut self.cache, &mut self.sql, &StatInput {
                                                 table: parquet_path.clone(),
                                                 column: curve.x_key.clone(),
                                                 filters: curve.filter.clone(),
-                                        }),
-                                    );
+                                        }));
+                                    }
+                                    if let(Some(stat)) = &self.histogram_view.stat {
+                                        draw_stat(
+                                            ui,
+                                            stat,
+                                        );
+                                    }
                                 });
                             }
                         });
@@ -531,25 +559,55 @@ impl eframe::App for MyApp {
                         }
 
 
-                        draw_histogram(ui, &mut self.cache, &mut self.sql, &self.histogram_view.input, &self.histogram_view.plot_settings);
+                        if self.histogram_view.update {
+                            self.histogram_view.histogram = Some(get_histogram(&mut self.cache, &mut self.sql, &self.histogram_view.input));
+                        }
+                        if let Some(hist) = &self.histogram_view.histogram {
+                            draw_histogram(ui, hist, &self.histogram_view.plot_settings);
+                        }
                     }
                 }
 
                 ui.separator();
-                // Display last SQL query and error
-                egui::CollapsingHeader::new("Last SQL Query:")
-                    .default_open(true) // collapsed by default
+                // Display SQL history with queries and errors
+                egui::CollapsingHeader::new(format!("SQL History ({} queries)", self.sql.history.len()))
+                    .default_open(true)
                     .show(ui, |ui| {
-                        ui.code(&self.sql.last_query);
-                    });
-                
-                ui.separator();
-                
-                egui::CollapsingHeader::new("Last SQL Error:")
-                    .default_open(true) // collapsed by default
-                    .show(ui, |ui| {
-                        ui.code(&self.sql.last_error);
-                    });
+                                for (i, (query, error)) in self.sql.history.iter().enumerate().rev() {
+                                    ui.push_id(i, |ui| {
+                                        // Show query number and status
+                                        let status_text = if error.is_some() { 
+                                            RichText::new( format!("Query #{} ❌", i)).color(egui::Color32::RED)
+                                        } else { 
+                                            RichText::new( format!("Query #{} ✅", i)).color(egui::Color32::GREEN)
+                                        };
+                                        
+                                        egui::CollapsingHeader::new(status_text)
+                                            .default_open(false) // Open most recent query by default
+                                            .show(ui, |ui| {
+                                                // Error (if any) in red
+                                                if let Some(err) = error {
+                                                    ui.add_space(5.0);
+                                                    ui.colored_label(egui::Color32::RED, "Error:");
+                                                    ui.colored_label(egui::Color32::RED, err);
+                                                }
+                                                // Query text
+                                                ui.label("Query:");
+                                                ui.code(query);
+                                                
+                                            });
+                                    });
+                                    
+                                    if i > 0 {
+                                        ui.separator();
+                                    }
+                                }
+                                
+                                if self.sql.history.is_empty() {
+                                    ui.label("No SQL queries executed yet");
+                                }
+                            });
+                self.histogram_view.update = false;
             });
         });
     }
@@ -557,15 +615,7 @@ impl eframe::App for MyApp {
 
 fn get_column_names<'a>(cache : &'a mut Cache, sql: &mut Sql, input : ColumnNamesInput) -> &'a Vec<ParsedString> {
     if ! cache.column_names.contains_key(&input) {
-        match compute_column_names(sql, &input) {
-            Ok(res) => {
-                cache.column_names.insert(input.clone(), res);
-            },
-            Err(e) => {
-                sql.last_error = format!("Error computing column names: {:?}", e);
-                cache.column_names.insert(input.clone(), ColumnNamesOutput { names : vec![] });
-            }
-        }
+        cache.column_names.insert(input.clone(),compute_column_names(sql, &input));
     }
     if let Some(res) = cache.column_names.get(&input) {
         &res.names
@@ -578,20 +628,36 @@ fn get_column_names<'a>(cache : &'a mut Cache, sql: &mut Sql, input : ColumnName
 fn compute_column_names(
     sql: &mut Sql,
     input : &ColumnNamesInput,
-) -> duckdb::Result<ColumnNamesOutput> {
-    let mut stmt = sql.prepare(
-        format!(
+) -> ColumnNamesOutput {
+    let query = format!(
         r#"
         DESCRIBE SELECT * FROM {};
        "#,&input.table.as_str()
-        ).as_str()
-    )?;
-    let column_names = stmt.query_map(params![], |row| {
-        ParsedString::parse(&row.get::<_, String>(0)?)
-        //Ok(row.get::<_, String>(1)?)
-    })?
-    .collect::<duckdb::Result<Vec<_>>>()?;
-    Ok(ColumnNamesOutput { names: column_names })
+        ).to_string();
+    // collect errors
+    let result: duckdb::Result<ColumnNamesOutput> = (||{
+        let mut stmt = sql.prepare(&query)?;
+        let column_names = stmt.query_map(params![], |row| {
+            ParsedString::parse(&row.get::<_, String>(0)?)
+            //Ok(row.get::<_, String>(1)?)
+        })?
+        .collect::<duckdb::Result<Vec<_>>>()?;
+        Ok(ColumnNamesOutput { names: column_names })
+    })();
+    match result {
+        Ok(res) => {
+            sql.history.push(
+                (query.clone(), None)
+            );
+            res
+        },
+        Err(e) => {
+            sql.history.push(
+                (query.clone(), Some(format!("Error computing column names: {:?}", e)))
+            );
+            ColumnNamesOutput { names : vec![] }
+        }
+    }
 }
 
 struct ColumnNamesOutput {
@@ -657,26 +723,20 @@ enum HistogramAggregation{
 //    Avg(ParsedString),
 //}
 
+#[derive(Clone)]
 struct HistogramOutput {
     // (bin_center, bin_width, count, stddev)
     data : Vec<(f64, f64, Vec<(f64, f64)>)>,
+    input : HistogramInput,
 }
 
 
-fn get_histogram<'a>(cache : &'a mut Cache, sql: &mut Sql, input : &'a HistogramInput) -> &'a HistogramOutput {
+fn get_histogram<'a>(cache : & mut Cache, sql: &mut Sql, input : & HistogramInput) -> HistogramOutput {
     if !cache.histogram.contains_key(input) {
-        match compute_histogram(sql, input){
-            Ok(res) => {
-                cache.histogram.insert(input.clone(), res);
-            },
-            Err(e) => {
-                sql.last_error = format!("Error computing histogram: {:?}", e);
-                cache.histogram.insert(input.clone(), HistogramOutput { data : vec![] });
-            }
-        }
+        cache.histogram.insert(input.clone(), compute_histogram(sql, input));
     }
     if let Some(res) = cache.histogram.get(input) {
-        res
+        res.clone()
     }
     else {
         panic!("Histogram cache miss");
@@ -686,7 +746,10 @@ fn get_histogram<'a>(cache : &'a mut Cache, sql: &mut Sql, input : &'a Histogram
 fn compute_histogram(
     sql: &mut Sql,
     hist : &HistogramInput,
-) -> duckdb::Result<HistogramOutput> {
+) -> HistogramOutput {
+    if hist.curves.is_empty() {
+        return HistogramOutput { data : vec![], input: hist.clone() };
+    }
     let mut filters:String= String::new();
     let mut hists = Vec::new();
     let mut coalesced = String::new();
@@ -781,7 +844,7 @@ buckets AS (
         x_keys,
         hist.bins as i64
     );
-    let stmt = sql.prepare(
+    let query = 
         format!(
         r#"
 WITH
@@ -800,24 +863,41 @@ FROM buckets AS b
         {}
 ORDER BY b.bucket
         "#,filters, combined, mid, hists.join(","),coalesced, joins
-    ).as_str())?.query_map(params![ ], |row| {
-        let bin_center = row.get::<_, f64>(1)?;
-        let bin_width = row.get::<_, f64>(2)?;
-        let mut values = Vec::new();
-        let n_curves = hist.curves.len();
-        for i in 0..n_curves {
-            let y_value = row.get::<_, f64>(3 + i * 2)?;
-            let y_error = row.get::<_, f64>(4 + i * 2)?;
-            values.push((y_value, y_error));
+    ).to_string();
+    let result :duckdb::Result<HistogramOutput> = (|| {
+        let stmt = sql.prepare(&query)?.query_map(params![ ], |row| {
+            let bin_center = row.get::<_, f64>(1)?;
+            let bin_width = row.get::<_, f64>(2)?;
+            let mut values = Vec::new();
+            let n_curves = hist.curves.len();
+            for i in 0..n_curves {
+                let y_value = row.get::<_, f64>(3 + i * 2)?;
+                let y_error = row.get::<_, f64>(4 + i * 2)?;
+                values.push((y_value, y_error));
+            }
+            Ok((
+                bin_center,
+                bin_width,
+                values,
+            ))
+        })?
+        .collect::<duckdb::Result<Vec<_>>>()?;
+        Ok(HistogramOutput { data: stmt, input: hist.clone() })
+    })();
+    match result {
+        Ok(res) => {
+            sql.history.push(
+                (query.clone(), None)
+            );
+            res
+        },
+        Err(e) => {
+            sql.history.push(
+                (query.clone(), Some(format!("Error computing histogram: {:?}", e)))
+            );
+            HistogramOutput { data : vec![], input: hist.clone() }
         }
-        Ok((
-            bin_center,
-            bin_width,
-            values,
-        ))
-    })?
-    .collect::<duckdb::Result<Vec<_>>>()?;
-    Ok(HistogramOutput { data: stmt })
+    }
 }
 
 #[derive(Hash, Eq, PartialEq, Clone)]
@@ -827,6 +907,7 @@ struct StatInput {
     filters : SQLFilter,
 }
 
+#[derive(Clone)]
 struct StatOutput {
     sum: f64,
     count: usize,
@@ -836,20 +917,12 @@ struct StatOutput {
     max : f64,
 }
 
-fn get_stat<'a>(cache : &'a mut Cache, sql: &mut Sql, input: &StatInput) -> &'a StatOutput {
+fn get_stat<'a>(cache : &'a mut Cache, sql: &mut Sql, input: &StatInput) ->  StatOutput {
     if !cache.stat.contains_key(input) {
-        match compute_stat(sql, input) {
-            Ok(res) => {
-                cache.stat.insert(input.clone(), res);
-            },
-            Err(e) => {
-                sql.last_error = format!("Error computing stat: {:?}", e);
-                cache.stat.insert(input.clone(), StatOutput { sum: 0.0, count: 0, mean: 0.0, stddev: 0.0, min: 0.0, max: 0.0 });
-            }
-        }
+        cache.stat.insert(input.clone(), compute_stat(sql, input));
     }
     if let Some(res) = cache.stat.get(input) {
-        res
+        res.clone()
     }
     else {
         panic!("Stat cache miss");
@@ -859,9 +932,8 @@ fn get_stat<'a>(cache : &'a mut Cache, sql: &mut Sql, input: &StatInput) -> &'a 
 fn compute_stat(
     sql: &mut Sql,
     stat_input : &StatInput,
-) -> duckdb::Result<StatOutput> {
-
-    let stmt = sql.prepare(
+) -> StatOutput {
+    let query= 
         format!(
         r#"
         SELECT 
@@ -882,23 +954,39 @@ fn compute_stat(
         stat_input.column,
         stat_input.table ,
         stat_input.filters.to_sql_where_prefix()
-        ).as_str()
-    )?.query_map(params![ ], |row| {
-        Ok(StatOutput {
-            sum: row.get(0)?,
-            count: row.get(1)?,
-            mean: row.get(2)?,
-            stddev: row.get(3)?,
-            min: row.get(4)?,
-            max: row.get(5)?,
-        })
-    })?
-    .next();
+        ).to_string();
+    let result = (||{
+        let stmt = sql.prepare(&query)?.query_map(params![ ], |row| {
+            Ok(StatOutput {
+                sum: row.get(0)?,
+                count: row.get(1)?,
+                mean: row.get(2)?,
+                stddev: row.get(3)?,
+                min: row.get(4)?,
+                max: row.get(5)?,
+            })
+        })?
+        .next();
 
-    if let Some(stat) = stmt {
-        stat
-    } else {
-        Err(duckdb::Error::QueryReturnedNoRows)
+        if let Some(stat) = stmt {
+            stat
+        } else {
+            Err(duckdb::Error::QueryReturnedNoRows)
+        }
+    })();
+    match result {
+        Ok(res) => {
+            sql.history.push(
+                (query.clone(), None)
+            );
+            res
+        },
+        Err(e) => {
+            sql.history.push(
+                (query.clone(), Some(format!("Error computing stat: {:?}", e)))
+            );
+            StatOutput { sum: 0.0, count: 0, mean: 0.0, stddev: 0.0, min: 0.0, max: 0.0 }
+        }
     }
 
 }
@@ -926,16 +1014,16 @@ fn transpose<T: Clone>(matrix: Vec<Vec<T>>) -> Vec<Vec<T>> {
 }
 
 fn draw_histogram<'a>(ui: &mut egui::Ui, 
-                      cache : &'a mut Cache,
-                      sql: &mut Sql,
-                      input : &'a HistogramInput,
+                      //cache : &'a mut Cache,
+                      //sql: &mut Sql,
+                      //input : &'a HistogramInput,
+                      hist : &HistogramOutput,
                       plot_settings: &HistrogramPlotSettings,
     ) {
-    if input.curves.is_empty() {
+    if hist.input.curves.is_empty() {
         ui.label("No histogram curves to display");
         return;
     }
-    let hist = get_histogram(cache, sql, input);
     let bars: Vec<Vec<Bar>> = transpose(hist.data
         .iter()
         .map(|(x,w , values)| 
@@ -953,7 +1041,7 @@ fn draw_histogram<'a>(ui: &mut egui::Ui,
     let charts: Vec<BarChart> = bars.iter()
     .enumerate()
     .map(|(i, bar_group)| {
-        let curve = &input.curves[i];
+        let curve = &hist.input.curves[i];
         // Extract just the filename without path and extension
         let filename = curve.table.as_str()
             .trim_matches('"')
@@ -979,11 +1067,11 @@ fn draw_histogram<'a>(ui: &mut egui::Ui,
         .height(400.0)
         .legend(Legend::default())
         .x_axis_label(
-            input.curves.iter().map(|c| c.x_key.as_str()).collect::<Vec<_>>().as_slice().join(" / ")
+            hist.input.curves.iter().map(|c| c.x_key.as_str()).collect::<Vec<_>>().as_slice().join(" / ")
         )
         // TODO move axis labels to legend
         .y_axis_label(
-            input.curves.iter().map(|c| 
+            hist.input.curves.iter().map(|c| 
                 match c.value_type {
                     HistogramAggregation::Count => "COUNT(".to_owned() +c.y_key.as_str() + ")",
                     HistogramAggregation::Avg => "AVG(".to_owned() + c.y_key.as_str() + ")",

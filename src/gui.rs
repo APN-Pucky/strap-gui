@@ -148,12 +148,18 @@ impl ParsedString {
 struct Sql {
     conn: duckdb::Connection,
     // request + error
-    history : Vec<(String, Option<String>)>,
+    history : Vec<(usize,String, Option<String>)>,
+    counter: usize,
     //last_query: String,
     //last_error: String,
 }
 
 impl Sql {
+    fn push_history(&mut self, query: String, error: Option<String>) {
+        self.counter += 1;
+        self.history.push((self.counter, query, error));
+    }
+
     fn prepare(&mut self, query: &str) -> duckdb::Result<duckdb::Statement> {
         //self.last_query = query.to_string();
         self.conn.prepare(query)
@@ -200,6 +206,7 @@ impl Default for MyApp {
             sql : Sql {
                 conn: Connection::open_in_memory().unwrap(),
                 history : vec![],
+                counter: 0,
             },
             filedialog: FileDialog::new(),
             operation: Operation::Histogram,
@@ -573,7 +580,7 @@ impl eframe::App for MyApp {
                 egui::CollapsingHeader::new(format!("SQL History ({} queries)", self.sql.history.len()))
                     .default_open(true)
                     .show(ui, |ui| {
-                                for (i, (query, error)) in self.sql.history.iter().enumerate().rev() {
+                                for ((i,query, error)) in self.sql.history.iter().rev() {
                                     ui.push_id(i, |ui| {
                                         // Show query number and status
                                         let status_text = if error.is_some() { 
@@ -598,7 +605,7 @@ impl eframe::App for MyApp {
                                             });
                                     });
                                     
-                                    if i > 0 {
+                                    if *i > 0 {
                                         ui.separator();
                                     }
                                 }
@@ -608,6 +615,10 @@ impl eframe::App for MyApp {
                                 }
                             });
                 self.histogram_view.update = false;
+                // truncate history to last 100 entries
+                if self.sql.history.len() > 100 {
+                    self.sql.history.drain(0..(self.sql.history.len() - 100));
+                }
             });
         });
     }
@@ -646,14 +657,14 @@ fn compute_column_names(
     })();
     match result {
         Ok(res) => {
-            sql.history.push(
-                (query.clone(), None)
+            sql.push_history(
+                query.clone(), None
             );
             res
         },
         Err(e) => {
-            sql.history.push(
-                (query.clone(), Some(format!("Error computing column names: {:?}", e)))
+            sql.push_history(
+                query.clone(), Some(format!("Error computing column names: {:?}", e))
             );
             ColumnNamesOutput { names : vec![] }
         }
@@ -886,14 +897,14 @@ ORDER BY b.bucket
     })();
     match result {
         Ok(res) => {
-            sql.history.push(
-                (query.clone(), None)
+            sql.push_history(
+                query.clone(), None
             );
             res
         },
         Err(e) => {
-            sql.history.push(
-                (query.clone(), Some(format!("Error computing histogram: {:?}", e)))
+            sql.push_history(
+                query.clone(), Some(format!("Error computing histogram: {:?}", e))
             );
             HistogramOutput { data : vec![], input: hist.clone() }
         }
@@ -976,14 +987,14 @@ fn compute_stat(
     })();
     match result {
         Ok(res) => {
-            sql.history.push(
-                (query.clone(), None)
+            sql.push_history(
+                query.clone(), None
             );
             res
         },
         Err(e) => {
-            sql.history.push(
-                (query.clone(), Some(format!("Error computing stat: {:?}", e)))
+            sql.push_history(
+                query.clone(), Some(format!("Error computing stat: {:?}", e))
             );
             StatOutput { sum: 0.0, count: 0, mean: 0.0, stddev: 0.0, min: 0.0, max: 0.0 }
         }

@@ -2,14 +2,14 @@ use std::collections::HashMap;
 
 use std::fs::File;
 use std::io::{BufRead, BufReader};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use std::sync::Arc;
 
 use flate2::bufread::GzDecoder;
 use itertools::Itertools;
 
-use arrow::array::{Float64Array, ArrayRef};
+use arrow::array::{ArrayRef, Float64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
@@ -17,22 +17,38 @@ use parquet::file::properties::WriterProperties;
 use zip::ZipArchive;
 use zstd::stream::read::Decoder as ZstdDecoder;
 
+pub const DEFAULT_PARQUET_CHUNK_SIZE: usize = 1000;
+
+pub fn default_parquet_path(path: impl AsRef<Path>) -> PathBuf {
+    let mut output = path.as_ref().as_os_str().to_os_string();
+    output.push(".parquet");
+    PathBuf::from(output)
+}
+
+pub fn convert_to_parquet(
+    input_path: impl AsRef<Path>,
+    output_path: impl AsRef<Path>,
+    chunk_size: usize,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let track = StrapTrack::new(input_path.as_ref())?;
+    track.to_parquet(output_path.as_ref(), chunk_size)
+}
 
 /// Iterator over STRAP file rows
 pub struct StrapTrackIterator {
-    all:bool,
+    all: bool,
     reader: Box<dyn BufRead>,
 }
 
 impl Iterator for StrapTrackIterator {
     type Item = Result<HashMap<String, f64>, std::io::Error>;
-    
+
     fn next(&mut self) -> Option<Self::Item> {
         let mut line = String::new();
         match self.reader.read_line(&mut line) {
             Ok(0) => None, // EOF
             Ok(_) => {
-                let parsed = StrapTrack::parse_line(&line,self.all);
+                let parsed = StrapTrack::parse_line(&line, self.all);
                 Some(Ok(parsed))
             }
             Err(e) => Some(Err(e)),
@@ -56,17 +72,14 @@ impl StrapTrack {
         // Verify file exists
         File::open(&path)?;
 
-        
-        Ok(Self {
-            file_path: path,
-        })
+        Ok(Self { file_path: path })
     }
 
     /// Create a reader that handles compression based on file extension
     fn create_reader(&self) -> Result<Box<dyn BufRead>, std::io::Error> {
         let file = File::open(&self.file_path)?;
         let path_str = self.file_path.to_string_lossy().to_lowercase();
-        
+
         if path_str.ends_with(".gz") || path_str.ends_with(".gzip") {
             // Gzip compressed
             let decoder = GzDecoder::new(BufReader::new(file));
@@ -80,16 +93,17 @@ impl StrapTrack {
             // ZIP archive - read first entry into memory
             let mut archive = ZipArchive::new(file)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-            
+
             if archive.len() == 0 {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    "ZIP archive is empty"
+                    "ZIP archive is empty",
                 ));
             }
-            
+
             // Read the first file in the archive into memory
-            let mut zip_file = archive.by_index(0)
+            let mut zip_file = archive
+                .by_index(0)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
             let mut contents = Vec::new();
             std::io::copy(&mut zip_file, &mut contents)?;
@@ -112,9 +126,8 @@ impl StrapTrack {
         Ok(unique_keys.into_iter().collect())
     }
 
-    
     /// Parse a single STRAP line into key-value pairs
-    fn parse_line(line: &str, all : bool) -> HashMap<String, f64> {
+    fn parse_line(line: &str, all: bool) -> HashMap<String, f64> {
         let mut result = HashMap::new();
         let line = line.trim();
 
@@ -124,8 +137,7 @@ impl StrapTrack {
             let after_strap = &line[pos..]; // Skip "@strap"
             if let Some(pos) = after_strap.find(char::is_whitespace) {
                 &after_strap[pos..]
-            }
-            else {
+            } else {
                 after_strap
             }
             .trim_start() // Remove any leading whitespace
@@ -137,7 +149,6 @@ impl StrapTrack {
             }
         };
 
-        
         // Parse key-value pairs separated by whitespace
         let tokens: Vec<&str> = line.split_whitespace().collect();
         for chunk in tokens.chunks(2) {
@@ -147,16 +158,16 @@ impl StrapTrack {
                 }
             }
         }
-        
+
         result
     }
-    
+
     /// Returns an iterator over all rows
     pub fn iter(&self) -> Result<StrapTrackIterator, std::io::Error> {
         // check if file name contains .strap or .strap.gz etc
         let path_str = self.file_path.to_string_lossy().to_lowercase();
-        let all = path_str.ends_with(".strap") 
-            || path_str.ends_with(".strap.gz") 
+        let all = path_str.ends_with(".strap")
+            || path_str.ends_with(".strap.gz")
             || path_str.ends_with(".strap.gzip")
             || path_str.ends_with(".strap.zst")
             || path_str.ends_with(".strap.zstd")
@@ -164,7 +175,7 @@ impl StrapTrack {
         let reader = self.create_reader()?;
         Ok(StrapTrackIterator { all, reader })
     }
-    
+
     /// Stream through all rows with a callback
     pub fn for_each_row<F>(&self, mut callback: F) -> Result<(), std::io::Error>
     where
@@ -177,14 +188,14 @@ impl StrapTrack {
         }
         Ok(())
     }
-    
+
     /// Filter rows based on a predicate
     pub fn filter_rows<F>(&self, predicate: F) -> Result<Vec<HashMap<String, f64>>, std::io::Error>
     where
         F: Fn(&HashMap<String, f64>) -> bool,
     {
         let mut results = Vec::new();
-        self.for_each_row(| row| {
+        self.for_each_row(|row| {
             if predicate(&row) {
                 results.push(row.clone());
             }
@@ -192,7 +203,7 @@ impl StrapTrack {
         })?;
         Ok(results)
     }
-    
+
     /// Aggregate a column with a reduction function
     pub fn aggregate<F, T>(&self, init: T, reducer: F) -> Result<T, std::io::Error>
     where
@@ -209,42 +220,38 @@ impl StrapTrack {
 
     /// Convert STRAP data to Parquet format
     pub fn to_parquet(
-        &self, 
-        filename: &str, 
+        &self,
+        filename: impl AsRef<Path>,
         chunk_size: usize,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-
-
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // 1. Collect all unique column names
         let mut column_names = self.get_column_names()?;
 
         column_names.sort(); // optional: deterministic column order
 
         // 2. Build schema
-        let fields: Vec<Field> = column_names.iter()
+        let fields: Vec<Field> = column_names
+            .iter()
             .map(|name| Field::new(name, DataType::Float64, true)) // nullable = true
             .collect();
         let schema = Arc::new(Schema::new(fields));
 
-
         // Setup Parquet writer
-        let file = File::create(filename)?;
+        let file = File::create(filename.as_ref())?;
         let props = WriterProperties::builder().build();
         let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props))?;
 
         for vhm in &self.iter()?.chunks(chunk_size) {
             let chunk_data: Result<Vec<_>, _> = vhm.collect();
             let chunk_data = chunk_data?;
-            
+
             // 3. Build arrays
             let mut arrays: Vec<ArrayRef> = Vec::new();
             for col in &column_names {
-                let values: Vec<Option<f64>> = chunk_data.iter()
-                    .map(|row| row.get(col).copied())
-                    .collect();
+                let values: Vec<Option<f64>> =
+                    chunk_data.iter().map(|row| row.get(col).copied()).collect();
                 arrays.push(Arc::new(Float64Array::from(values)) as ArrayRef);
             }
-
 
             // 4. Build RecordBatch
             let batch = RecordBatch::try_new(schema.clone(), arrays)?;
@@ -255,7 +262,6 @@ impl StrapTrack {
         println!("Sparse Parquet written!");
         Ok(())
     }
-
 }
 
 #[cfg(test)]
@@ -300,7 +306,10 @@ mod tests {
 
     #[test]
     fn test_parse_strap_with_metadata() {
-        let result = StrapTrack::parse_line("DATE TIME OR OTHER_METADATA @strap damage 15.0 attacker_alice 1.0 defender_bob 1.0", false);
+        let result = StrapTrack::parse_line(
+            "DATE TIME OR OTHER_METADATA @strap damage 15.0 attacker_alice 1.0 defender_bob 1.0",
+            false,
+        );
         assert_eq!(result.get("damage"), Some(&15.0));
         assert_eq!(result.get("attacker_alice"), Some(&1.0));
         assert_eq!(result.get("defender_bob"), Some(&1.0));
@@ -314,16 +323,16 @@ mod tests {
 
     #[test]
     fn test_parse_whitespace_only() {
-        let result = StrapTrack::parse_line("   \t  ",true);
+        let result = StrapTrack::parse_line("   \t  ", true);
         assert!(result.is_empty());
     }
 
     #[test]
     fn test_parse_odd_number_tokens() {
-        let result = StrapTrack::parse_line("key1 1.0 key2",true);
+        let result = StrapTrack::parse_line("key1 1.0 key2", true);
         assert_eq!(result.get("key1"), Some(&1.0));
         assert!(!result.contains_key("key2"));
-        let result = StrapTrack::parse_line("key1 1.0 key2",false);
+        let result = StrapTrack::parse_line("key1 1.0 key2", false);
         assert!(result.is_empty());
     }
 
@@ -341,10 +350,10 @@ mod tests {
         let content = "alice_sword 2.2 bob_bow 5.0\ndamage 2.0 attacker_alice 1.0\n";
         let file = create_test_file(".strap", content);
         let track = StrapTrack::new(file.path()).unwrap();
-        
+
         let rows: Result<Vec<_>, _> = track.iter().unwrap().collect();
         let rows = rows.unwrap();
-        
+
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].get("alice_sword"), Some(&2.2));
         assert_eq!(rows[1].get("damage"), Some(&2.0));
@@ -355,10 +364,10 @@ mod tests {
         let content = "a 1.0 b 2.0\nc 3.0 d 4.0\na 5.0 e 6.0\n";
         let file = create_test_file(".strap", content);
         let track = StrapTrack::new(file.path()).unwrap();
-        
+
         let mut columns = track.get_column_names().unwrap();
         columns.sort();
-        
+
         assert_eq!(columns, vec!["a", "b", "c", "d", "e"]);
     }
 
@@ -367,11 +376,11 @@ mod tests {
         let content = "type 1.0 value 10.0\ntype 2.0 value 20.0\ntype 1.0 value 15.0\n";
         let file = create_test_file(".strap", content);
         let track = StrapTrack::new(file.path()).unwrap();
-        
-        let filtered = track.filter_rows(|row| {
-            row.get("type") == Some(&1.0)
-        }).unwrap();
-        
+
+        let filtered = track
+            .filter_rows(|row| row.get("type") == Some(&1.0))
+            .unwrap();
+
         assert_eq!(filtered.len(), 2);
         assert_eq!(filtered[0].get("value"), Some(&10.0));
         assert_eq!(filtered[1].get("value"), Some(&15.0));
@@ -382,11 +391,11 @@ mod tests {
         let content = "@strap value 10.0\n@strap value 20.0\n@strap value 15.0\n";
         let file = create_test_file(".log", content);
         let track = StrapTrack::new(file.path()).unwrap();
-        
-        let sum = track.aggregate(0.0, |acc, row| {
-            acc + row.get("value").unwrap_or(&0.0)
-        }).unwrap();
-        
+
+        let sum = track
+            .aggregate(0.0, |acc, row| acc + row.get("value").unwrap_or(&0.0))
+            .unwrap();
+
         assert_eq!(sum, 45.0);
     }
 
@@ -395,10 +404,10 @@ mod tests {
         let content = "@strap a 1.0\n@strap1 b 2.0\nNOISE @strap c 3.0\nregular 4.0\n";
         let file = create_test_file(".strap", content);
         let track = StrapTrack::new(file.path()).unwrap();
-        
+
         let rows: Result<Vec<_>, _> = track.iter().unwrap().collect();
         let rows = rows.unwrap();
-        
+
         assert_eq!(rows.len(), 4);
         assert_eq!(rows[0].get("a"), Some(&1.0));
         assert_eq!(rows[1].get("b"), Some(&2.0));
@@ -424,5 +433,23 @@ mod tests {
         let result = StrapTrack::parse_line("deficit -42.5 surplus 100.0", true);
         assert_eq!(result.get("deficit"), Some(&-42.5));
         assert_eq!(result.get("surplus"), Some(&100.0));
+    }
+
+    #[test]
+    fn test_default_parquet_path_appends_extension() {
+        let output = default_parquet_path("/tmp/example.strap.gz");
+        assert_eq!(output, PathBuf::from("/tmp/example.strap.gz.parquet"));
+    }
+
+    #[test]
+    fn test_convert_to_parquet_writes_output_file() {
+        let input = create_test_file(".strap", "@strap value 10.0\n@strap value 20.0\n");
+        let temp_dir = tempfile::tempdir().unwrap();
+        let output = temp_dir.path().join("converted.parquet");
+
+        convert_to_parquet(input.path(), &output, 2).unwrap();
+
+        let metadata = std::fs::metadata(output).unwrap();
+        assert!(metadata.len() > 0);
     }
 }

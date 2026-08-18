@@ -151,43 +151,46 @@ pub fn strap_to_parquet<R: BufRead>(
         return Ok(());
     }
 
+    // now we merge the temp files into one final file
+
     (schema,writer) = StrapTrack::make_new_schema_and_writer(column_names.clone(), filename, 0)?;
     for i in 1..=schema_changes {
-    let file = File::open(StrapTrack::name_parquet_file(filename, i))?;
+        let file = File::open(StrapTrack::name_parquet_file(filename, i))?;
 
-    let reader = ParquetRecordBatchReaderBuilder::try_new(file)?
-        .build()?;
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file)?
+            .build()?;
 
-    for batch in reader {
-        let batch = batch?;
+        for batch in reader {
+            let batch = batch?;
 
-        let arrays: Vec<ArrayRef> = schema
-            .fields()
-            .iter()
-            .map(|field| {
-                match batch.schema().index_of(field.name()) {
-                    Ok(index) => batch.column(index).clone(),
+            let arrays: Vec<ArrayRef> = schema
+                .fields()
+                .iter()
+                .map(|field| {
+                    match batch.schema().index_of(field.name()) {
+                        Ok(index) => batch.column(index).clone(),
 
-                    Err(_) => {
-                        new_null_array(
-                            field.data_type(),
-                            batch.num_rows(),
-                        )
+                        Err(_) => {
+                            new_null_array(
+                                field.data_type(),
+                                batch.num_rows(),
+                            )
+                        }
                     }
-                }
-            })
-            .collect();
+                })
+                .collect();
 
-        let batch =
-            RecordBatch::try_new(schema.clone(), arrays)?;
+            let batch =
+                RecordBatch::try_new(schema.clone(), arrays)?;
 
-        writer.write(&batch)?;
+            writer.write(&batch)?;
+        }
+        // delete the temp file
+        std::fs::remove_file(StrapTrack::name_parquet_file(filename, i))?;
     }
-}
 
-writer.close()?;
+    writer.close()?;
 
-    // now we merge the temp files into one final file
 
     Ok(())
 }

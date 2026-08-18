@@ -66,7 +66,7 @@ pub fn name_parquet_file(filename: &str, schema_changes: usize) -> String {
     if schema_changes == 0 {
         return filename.to_string();
     }
-    format!("{}_temp_{}", filename, schema_changes)
+    format!("{}_{}.tmp", filename, schema_changes)
 }
 
 pub fn make_new_schema_and_writer(

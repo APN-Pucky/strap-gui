@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use std::sync::Arc;
@@ -18,6 +18,107 @@ use zip::ZipArchive;
 use zstd::stream::read::Decoder as ZstdDecoder;
 
 pub const DEFAULT_PARQUET_CHUNK_SIZE: usize = 1000;
+const PROGRESS_REPORT_BYTES: u64 = 1 << 20;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParquetProgressPhase {
+    DiscoverColumns,
+    WriteParquet,
+}
+
+impl ParquetProgressPhase {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::DiscoverColumns => "scan columns (pass 1/2)",
+            Self::WriteParquet => "write parquet (pass 2/2)",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParquetProgress {
+    pub phase: ParquetProgressPhase,
+    pub bytes_read: u64,
+    pub total_bytes: u64,
+}
+
+pub trait ParquetProgressObserver: Send + Sync {
+    fn on_progress(&self, progress: ParquetProgress);
+}
+
+struct ProgressReader<R> {
+    inner: R,
+    phase: ParquetProgressPhase,
+    total_bytes: u64,
+    bytes_read: u64,
+    last_reported: u64,
+    observer: Option<Arc<dyn ParquetProgressObserver>>,
+}
+
+impl<R> ProgressReader<R> {
+    fn new(
+        inner: R,
+        phase: ParquetProgressPhase,
+        total_bytes: u64,
+        observer: Option<Arc<dyn ParquetProgressObserver>>,
+    ) -> Self {
+        if let Some(observer) = observer.as_ref() {
+            observer.on_progress(ParquetProgress {
+                phase,
+                bytes_read: 0,
+                total_bytes,
+            });
+        }
+
+        Self {
+            inner,
+            phase,
+            total_bytes,
+            bytes_read: 0,
+            last_reported: 0,
+            observer,
+        }
+    }
+
+    fn report_progress(&mut self, force: bool) {
+        if !force
+            && self.bytes_read.saturating_sub(self.last_reported) < PROGRESS_REPORT_BYTES
+            && self.bytes_read < self.total_bytes
+        {
+            return;
+        }
+
+        self.last_reported = self.bytes_read;
+
+        if let Some(observer) = self.observer.as_ref() {
+            observer.on_progress(ParquetProgress {
+                phase: self.phase,
+                bytes_read: self.bytes_read.min(self.total_bytes),
+                total_bytes: self.total_bytes,
+            });
+        }
+    }
+}
+
+impl<R: Read> Read for ProgressReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, std::io::Error> {
+        let bytes = self.inner.read(buf)?;
+        if bytes == 0 {
+            self.report_progress(true);
+            return Ok(0);
+        }
+
+        self.bytes_read = self.bytes_read.saturating_add(bytes as u64);
+        self.report_progress(false);
+        Ok(bytes)
+    }
+}
+
+impl<R: Seek> Seek for ProgressReader<R> {
+    fn seek(&mut self, pos: SeekFrom) -> Result<u64, std::io::Error> {
+        self.inner.seek(pos)
+    }
+}
 
 pub fn default_parquet_path(path: impl AsRef<Path>) -> PathBuf {
     let mut output = path.as_ref().as_os_str().to_os_string();
@@ -30,8 +131,17 @@ pub fn convert_to_parquet(
     output_path: impl AsRef<Path>,
     chunk_size: usize,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    convert_to_parquet_with_progress(input_path, output_path, chunk_size, None)
+}
+
+pub fn convert_to_parquet_with_progress(
+    input_path: impl AsRef<Path>,
+    output_path: impl AsRef<Path>,
+    chunk_size: usize,
+    observer: Option<Arc<dyn ParquetProgressObserver>>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let track = StrapTrack::new(input_path.as_ref())?;
-    track.to_parquet(output_path.as_ref(), chunk_size)
+    track.to_parquet_with_progress(output_path.as_ref(), chunk_size, observer)
 }
 
 /// Iterator over STRAP file rows
@@ -75,10 +185,36 @@ impl StrapTrack {
         Ok(Self { file_path: path })
     }
 
+    fn input_size_bytes(&self) -> Result<u64, std::io::Error> {
+        Ok(std::fs::metadata(&self.file_path)?.len())
+    }
+
+    fn report_phase_completion(
+        &self,
+        phase: ParquetProgressPhase,
+        observer: Option<&Arc<dyn ParquetProgressObserver>>,
+    ) -> Result<(), std::io::Error> {
+        if let Some(observer) = observer {
+            let total_bytes = self.input_size_bytes()?;
+            observer.on_progress(ParquetProgress {
+                phase,
+                bytes_read: total_bytes,
+                total_bytes,
+            });
+        }
+        Ok(())
+    }
+
     /// Create a reader that handles compression based on file extension
-    fn create_reader(&self) -> Result<Box<dyn BufRead>, std::io::Error> {
+    fn create_reader_for_phase(
+        &self,
+        phase: ParquetProgressPhase,
+        observer: Option<Arc<dyn ParquetProgressObserver>>,
+    ) -> Result<Box<dyn BufRead>, std::io::Error> {
         let file = File::open(&self.file_path)?;
+        let total_bytes = file.metadata()?.len();
         let path_str = self.file_path.to_string_lossy().to_lowercase();
+        let file = ProgressReader::new(file, phase, total_bytes, observer);
 
         if path_str.ends_with(".gz") || path_str.ends_with(".gzip") {
             // Gzip compressed
@@ -116,31 +252,50 @@ impl StrapTrack {
 
     /// Get column names from all rows
     pub fn get_column_names(&self) -> Result<Vec<String>, std::io::Error> {
+        self.get_column_names_with_progress(None)
+    }
+
+    fn get_column_names_with_progress(
+        &self,
+        observer: Option<Arc<dyn ParquetProgressObserver>>,
+    ) -> Result<Vec<String>, std::io::Error> {
         let mut unique_keys = std::collections::HashSet::new();
 
-        for hm in self.iter()? {
+        for hm in self.iter_for_phase(ParquetProgressPhase::DiscoverColumns, observer.clone())? {
             for key in hm?.keys() {
                 unique_keys.insert(key.clone());
             }
         }
+        self.report_phase_completion(ParquetProgressPhase::DiscoverColumns, observer.as_ref())?;
         Ok(unique_keys.into_iter().collect())
     }
 
-    /// Parse a single STRAP line into key-value pairs
-    fn parse_line(line: &str, all: bool) -> HashMap<String, f64> {
-        let mut result = HashMap::new();
+    /// Returns the payload following the first `@strap...` marker on the line.
+    pub fn strap_payload(line: &str) -> Option<&str> {
         let line = line.trim();
+        let pos = line.find("@strap")?;
+        let after_strap = &line[pos..];
 
-        // Handle @strap prefix - find first occurrence and continue from there
-        let line = if let Some(pos) = line.find("@strap") {
-            // Skip past "@strap" and any following digit/space
-            let after_strap = &line[pos..]; // Skip "@strap"
+        Some(
             if let Some(pos) = after_strap.find(char::is_whitespace) {
                 &after_strap[pos..]
             } else {
                 after_strap
             }
-            .trim_start() // Remove any leading whitespace
+            .trim_start(),
+        )
+    }
+
+    /// Parse a single STRAP line into key-value pairs.
+    ///
+    /// When `all` is false, only lines containing an `@strap` marker are parsed.
+    pub fn parse_line(line: &str, all: bool) -> HashMap<String, f64> {
+        let mut result = HashMap::new();
+        let line = line.trim();
+
+        // Handle @strap prefix - find first occurrence and continue from there
+        let line = if let Some(payload) = Self::strap_payload(line) {
+            payload
         } else {
             if all {
                 line
@@ -164,6 +319,14 @@ impl StrapTrack {
 
     /// Returns an iterator over all rows
     pub fn iter(&self) -> Result<StrapTrackIterator, std::io::Error> {
+        self.iter_for_phase(ParquetProgressPhase::WriteParquet, None)
+    }
+
+    fn iter_for_phase(
+        &self,
+        phase: ParquetProgressPhase,
+        observer: Option<Arc<dyn ParquetProgressObserver>>,
+    ) -> Result<StrapTrackIterator, std::io::Error> {
         // check if file name contains .strap or .strap.gz etc
         let path_str = self.file_path.to_string_lossy().to_lowercase();
         let all = path_str.ends_with(".strap")
@@ -172,7 +335,7 @@ impl StrapTrack {
             || path_str.ends_with(".strap.zst")
             || path_str.ends_with(".strap.zstd")
             || path_str.ends_with(".strap.zip");
-        let reader = self.create_reader()?;
+        let reader = self.create_reader_for_phase(phase, observer)?;
         Ok(StrapTrackIterator { all, reader })
     }
 
@@ -224,8 +387,54 @@ impl StrapTrack {
         filename: impl AsRef<Path>,
         chunk_size: usize,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.to_parquet_with_progress(filename, chunk_size, None)
+    }
+
+    pub fn to_parquet_with_progress(
+        &self,
+        filename: impl AsRef<Path>,
+        chunk_size: usize,
+        observer: Option<Arc<dyn ParquetProgressObserver>>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // 1. Collect all unique column names
-        let mut column_names = self.get_column_names()?;
+        let column_names = self.get_column_names_with_progress(observer.clone())?;
+
+        self.to_parquet_with_known_columns_and_progress(
+            filename,
+            chunk_size,
+            observer,
+            column_names,
+        )
+    }
+
+    pub fn to_parquet_with_known_columns(
+        &self,
+        filename: impl AsRef<Path>,
+        chunk_size: usize,
+        column_names: Vec<String>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.to_parquet_with_known_columns_and_progress(filename, chunk_size, None, column_names)
+    }
+
+    pub fn to_parquet_with_known_columns_and_progress(
+        &self,
+        filename: impl AsRef<Path>,
+        chunk_size: usize,
+        observer: Option<Arc<dyn ParquetProgressObserver>>,
+        mut column_names: Vec<String>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if let Some(observer) = observer.as_ref() {
+            let total_bytes = self.input_size_bytes()?;
+            observer.on_progress(ParquetProgress {
+                phase: ParquetProgressPhase::DiscoverColumns,
+                bytes_read: total_bytes,
+                total_bytes,
+            });
+        }
+
+        if column_names.is_empty() {
+            return Err("cannot write parquet without any discovered columns".into());
+        }
 
         column_names.sort(); // optional: deterministic column order
 
@@ -241,7 +450,10 @@ impl StrapTrack {
         let props = WriterProperties::builder().build();
         let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props))?;
 
-        for vhm in &self.iter()?.chunks(chunk_size) {
+        for vhm in &self
+            .iter_for_phase(ParquetProgressPhase::WriteParquet, observer.clone())?
+            .chunks(chunk_size)
+        {
             let chunk_data: Result<Vec<_>, _> = vhm.collect();
             let chunk_data = chunk_data?;
 
@@ -258,8 +470,8 @@ impl StrapTrack {
             // 5. Write Parquet
             writer.write(&batch)?;
         }
+        self.report_phase_completion(ParquetProgressPhase::WriteParquet, observer.as_ref())?;
         writer.close()?;
-        println!("Sparse Parquet written!");
         Ok(())
     }
 }
@@ -268,6 +480,7 @@ impl StrapTrack {
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::sync::Mutex;
     use tempfile::NamedTempFile;
 
     fn create_test_file(suffix: &str, content: &str) -> NamedTempFile {
@@ -451,5 +664,47 @@ mod tests {
 
         let metadata = std::fs::metadata(output).unwrap();
         assert!(metadata.len() > 0);
+    }
+
+    #[derive(Default)]
+    struct RecordingObserver {
+        progress: Mutex<Vec<ParquetProgress>>,
+    }
+
+    impl ParquetProgressObserver for RecordingObserver {
+        fn on_progress(&self, progress: ParquetProgress) {
+            self.progress.lock().unwrap().push(progress);
+        }
+    }
+
+    #[test]
+    fn test_convert_to_parquet_reports_progress_for_both_phases() {
+        let input = create_test_file(".strap", "@strap value 10.0\n@strap other 20.0\n");
+        let temp_dir = tempfile::tempdir().unwrap();
+        let output = temp_dir.path().join("converted-with-progress.parquet");
+        let observer = Arc::new(RecordingObserver::default());
+
+        convert_to_parquet_with_progress(input.path(), &output, 2, Some(observer.clone())).unwrap();
+
+        let progress = observer.progress.lock().unwrap();
+        let total_bytes = std::fs::metadata(input.path()).unwrap().len();
+
+        assert!(
+            progress
+                .iter()
+                .any(|update| update.phase == ParquetProgressPhase::DiscoverColumns)
+        );
+        assert!(
+            progress
+                .iter()
+                .any(|update| update.phase == ParquetProgressPhase::WriteParquet)
+        );
+        assert!(progress.iter().any(|update| {
+            update.phase == ParquetProgressPhase::DiscoverColumns
+                && update.bytes_read == total_bytes
+        }));
+        assert!(progress.iter().any(|update| {
+            update.phase == ParquetProgressPhase::WriteParquet && update.bytes_read == total_bytes
+        }));
     }
 }

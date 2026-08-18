@@ -10,7 +10,11 @@ path = "src/lib.rs"
 
 [[bin]]
 name = "strap-gui"
-path = "src/gui.rs"
+path = "src/bin/strap-gui.rs"
+
+[[bin]]
+name = "strap2parquet"
+path = "src/bin/strap2parquet.rs"
 
 [dependencies]
 clap = "4.5.53"
@@ -30,3 +34,4 @@ tempfile = "3.24.0"
 zip = "6.0.0"
 zstd = "0.13.3"
 flate2 = "1.1.5"
+indicatif = "0.17"

@@ -4,6 +4,10 @@ use std::{
     collections::HashMap,
     fmt::{self},
     ops::Deref,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+    thread,
+    time::Duration,
 };
 
 use duckdb::{Connection, params};
@@ -15,7 +19,8 @@ use strum::IntoEnumIterator;
 use strum_macros::{Display, EnumIter};
 
 use straptrack::{
-    DEFAULT_PARQUET_CHUNK_SIZE, StrapTrack, convert_to_parquet, default_parquet_path,
+    DEFAULT_PARQUET_CHUNK_SIZE, ParquetProgress, ParquetProgressObserver, ParquetProgressPhase,
+    convert_to_parquet_with_progress, default_parquet_path,
 };
 
 #[derive(Hash, Eq, PartialEq, Clone)]
@@ -204,6 +209,8 @@ struct MyApp {
 
     histogram_view: HistogramView,
     global_id_counter: usize,
+    conversion_task: Option<ConversionTask>,
+    import_error: Option<String>,
 }
 
 struct HistogramView {
@@ -219,6 +226,69 @@ struct HistogramView {
 struct HistrogramPlotSettings {
     //x_axis_scale: HistogramAxisScale,
     //y_axis_scale: HistogramAxisScale,
+}
+
+#[derive(Clone)]
+struct ConversionTaskState {
+    input_path: PathBuf,
+    output_path: PathBuf,
+    phase: ParquetProgressPhase,
+    bytes_read: u64,
+    total_bytes: u64,
+    result: Option<Result<(), String>>,
+}
+
+struct ConversionTask {
+    state: Arc<Mutex<ConversionTaskState>>,
+}
+
+struct GuiConversionObserver {
+    state: Arc<Mutex<ConversionTaskState>>,
+}
+
+impl ParquetProgressObserver for GuiConversionObserver {
+    fn on_progress(&self, progress: ParquetProgress) {
+        let mut state = self.state.lock().unwrap();
+        state.phase = progress.phase;
+        state.bytes_read = progress.bytes_read;
+        state.total_bytes = progress.total_bytes;
+    }
+}
+
+impl ConversionTask {
+    fn start(input_path: PathBuf) -> Self {
+        let output_path = default_parquet_path(&input_path);
+        let state = Arc::new(Mutex::new(ConversionTaskState {
+            input_path: input_path.clone(),
+            output_path: output_path.clone(),
+            phase: ParquetProgressPhase::DiscoverColumns,
+            bytes_read: 0,
+            total_bytes: 0,
+            result: None,
+        }));
+
+        let worker_state = Arc::clone(&state);
+        thread::spawn(move || {
+            let observer: Arc<dyn ParquetProgressObserver> = Arc::new(GuiConversionObserver {
+                state: Arc::clone(&worker_state),
+            });
+            let result = convert_to_parquet_with_progress(
+                &input_path,
+                &output_path,
+                DEFAULT_PARQUET_CHUNK_SIZE,
+                Some(observer),
+            )
+            .map_err(|err| err.to_string());
+
+            worker_state.lock().unwrap().result = Some(result);
+        });
+
+        Self { state }
+    }
+
+    fn snapshot(&self) -> ConversionTaskState {
+        self.state.lock().unwrap().clone()
+    }
 }
 
 impl Default for MyApp {
@@ -252,12 +322,152 @@ impl Default for MyApp {
                 //bin_scale: HistogramBinScale::Linear,
             },
             global_id_counter: 0,
+            conversion_task: None,
+            import_error: None,
+        }
+    }
+}
+
+impl MyApp {
+    fn handle_selected_file(&mut self, file: PathBuf) {
+        let is_parquet = file.extension().and_then(|s| s.to_str()) == Some("parquet");
+        if is_parquet {
+            if let Err(err) = self.add_histogram_from_parquet(&file) {
+                self.import_error = Some(err);
+            }
+            return;
+        }
+
+        self.conversion_task = Some(ConversionTask::start(file));
+    }
+
+    fn add_histogram_from_parquet(&mut self, file: &Path) -> Result<(), String> {
+        let parquet_path = ParsedString::parse(file.to_string_lossy().as_ref())
+            .map_err(|_| "Faulty characters in file path".to_owned())?;
+        let columns = get_column_names(
+            &mut self.cache,
+            &mut self.sql,
+            ColumnNamesInput {
+                table: parquet_path.clone(),
+            },
+        );
+
+        if columns.is_empty() {
+            return Err("No columns found in file".to_owned());
+        }
+
+        let key = columns
+            .first()
+            .cloned()
+            .ok_or_else(|| "No valid columns found in file".to_owned())?;
+
+        self.global_id_counter += 1;
+        self.histogram_view.input.curves.push(HistogramSubInput {
+            id: self.global_id_counter,
+            table: parquet_path,
+            filter: SQLFilter { conditions: vec![] },
+            x_key: key.clone(),
+            value_type: HistogramAggregation::Count,
+            y_key: key,
+        });
+
+        Ok(())
+    }
+
+    fn poll_conversion_task(&mut self, ctx: &egui::Context) {
+        let snapshot = self.conversion_task.as_ref().map(ConversionTask::snapshot);
+        let Some(snapshot) = snapshot else {
+            return;
+        };
+
+        if snapshot.result.is_none() {
+            ctx.request_repaint_after(Duration::from_millis(100));
+            return;
+        }
+
+        self.conversion_task = None;
+        match snapshot.result.unwrap() {
+            Ok(()) => {
+                if let Err(err) = self.add_histogram_from_parquet(&snapshot.output_path) {
+                    self.import_error = Some(err);
+                }
+            }
+            Err(err) => {
+                self.import_error = Some(format!(
+                    "Error converting {} to parquet: {}",
+                    snapshot.input_path.display(),
+                    err
+                ));
+            }
+        }
+    }
+
+    fn show_conversion_popup(&self, ctx: &egui::Context) {
+        let Some(conversion_task) = &self.conversion_task else {
+            return;
+        };
+
+        let snapshot = conversion_task.snapshot();
+        let phase_total = snapshot.total_bytes.max(1);
+        let combined_total = phase_total.saturating_mul(2);
+        let phase_position = snapshot.bytes_read.min(phase_total);
+        let combined_position = match snapshot.phase {
+            ParquetProgressPhase::DiscoverColumns => phase_position,
+            ParquetProgressPhase::WriteParquet => phase_total.saturating_add(phase_position),
+        };
+        let progress = combined_position as f32 / combined_total as f32;
+
+        egui::Window::new("Converting STRAP File")
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.label(snapshot.input_path.display().to_string());
+                ui.add_space(8.0);
+                ui.add(
+                    egui::ProgressBar::new(progress)
+                        .desired_width(320.0)
+                        .show_percentage()
+                        .text(snapshot.phase.label()),
+                );
+                ui.label(format!(
+                    "{} / {}",
+                    format_bytes(combined_position),
+                    format_bytes(combined_total)
+                ));
+            });
+    }
+
+    fn show_import_error(&mut self, ctx: &egui::Context) {
+        let Some(message) = self.import_error.clone() else {
+            return;
+        };
+
+        let mut open = true;
+        let mut close_clicked = false;
+        egui::Window::new("Import Error")
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label(message);
+                ui.add_space(8.0);
+                if ui.button("Close").clicked() {
+                    close_clicked = true;
+                }
+            });
+
+        if !open || close_clicked {
+            self.import_error = None;
         }
     }
 }
 
 impl eframe::App for MyApp {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
+        self.poll_conversion_task(ctx);
+
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::ScrollArea::both().show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
@@ -300,7 +510,13 @@ impl eframe::App for MyApp {
 
                         ui.separator();
 
-                        if ui.button("Add Histogram").clicked() {
+                        if ui
+                            .add_enabled(
+                                self.conversion_task.is_none(),
+                                egui::Button::new("Add Histogram"),
+                            )
+                            .clicked()
+                        {
                             self.filedialog.select_file();
                         };
 
@@ -320,52 +536,10 @@ impl eframe::App for MyApp {
                         // Update the dialog
                         self.filedialog.update(ctx);
 
-                        if let Some(path) = self.filedialog.selected(){
+                        if let Some(path) = self.filedialog.selected() {
                             let file = path.to_path_buf();
                             self.filedialog = FileDialog::new();
-                            let parquet_path =
-                                // if file does not end in .parquet, convert to parquet
-                                if file.extension().and_then(|s| s.to_str()) != Some("parquet") {
-                                    let pp = default_parquet_path(&file);
-                                    let mut parquet_path = ParsedString::parse(&pp.to_string_lossy()).ok();
-                                    if parquet_path.is_some()
-                                        && convert_to_parquet(&file, &pp, DEFAULT_PARQUET_CHUNK_SIZE).is_err()
-                                    {
-                                        // error converting to parquet
-                                        ui.label("Error converting to parquet");
-                                        parquet_path = None
-                                    }
-                                    parquet_path
-                                } else {
-                                    ParsedString::parse(&file.to_string_lossy()).ok()
-                                };
-                                if let Some(parquetpath) = &parquet_path {
-                                    let columns = get_column_names(&mut self.cache, &mut self.sql, ColumnNamesInput { table: parquetpath.clone() });
-                                    if columns.is_empty() {
-                                        ui.label("No columns found in file");
-                                        return;
-                                    }
-                                    let key = columns.first();
-                                    if let Some(key) = key {
-                                        self.global_id_counter += 1;
-                                        self.histogram_view.input.curves.push(HistogramSubInput {
-                                            id : self.global_id_counter,
-                                            table: parquetpath.clone(),
-                                            filter: SQLFilter { conditions: vec![] },
-                                            x_key: key.clone(),
-                                            value_type: HistogramAggregation::Count,
-                                            y_key: key.clone(),
-                                        });
-                                    }
-                                    else {
-                                        ui.label("No valid columns found in file");
-                                        return;
-                                    }
-                                }
-                                else {
-                                    ui.label("Faulty characters in file path");
-                                    return;
-                                }
+                            self.handle_selected_file(file);
                         }
 
                         let mut curves_to_clone = Vec::new();
@@ -641,6 +815,9 @@ impl eframe::App for MyApp {
                 }
             });
         });
+
+        self.show_conversion_popup(ctx);
+        self.show_import_error(ctx);
     }
 }
 
@@ -1177,6 +1354,26 @@ fn draw_histogram<'a>(
                 plot_ui.bar_chart(chart);
             }
         });
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+
+    let mut value = bytes as f64;
+    let mut unit = UNITS[0];
+    for next_unit in UNITS.iter().skip(1) {
+        if value < 1024.0 {
+            break;
+        }
+        value /= 1024.0;
+        unit = next_unit;
+    }
+
+    if unit == "B" {
+        format!("{} {}", bytes, unit)
+    } else {
+        format!("{value:.1} {unit}")
+    }
 }
 
 fn main() -> Result<(), eframe::Error> {

@@ -373,7 +373,7 @@ impl StrapTrack {
         Ok(())
     }
     /// Convert STRAP data to Parquet format
-    pub fn new_to_parquet(
+    pub fn to_parquet(
         &self,
         filename: impl AsRef<Path>,
         chunk_size: usize,
@@ -385,7 +385,7 @@ impl StrapTrack {
     }
 
     /// Convert STRAP data to Parquet format
-    pub fn to_parquet(
+    pub fn old_to_parquet(
         &self,
         filename: impl AsRef<Path>,
         chunk_size: usize,

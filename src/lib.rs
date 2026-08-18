@@ -19,7 +19,7 @@ use parquet::file::properties::WriterProperties;
 use zip::ZipArchive;
 use zstd::stream::read::Decoder as ZstdDecoder;
 
-pub const DEFAULT_PARQUET_CHUNK_SIZE: usize = 1000;
+pub const DEFAULT_PARQUET_CHUNK_SIZE: usize = 2048;
 
 pub fn default_parquet_path(path: impl AsRef<Path>) -> PathBuf {
     let mut output = path.as_ref().as_os_str().to_os_string();
@@ -45,14 +45,19 @@ impl<R: BufRead> Iterator for StrapIterator<R> {
     type Item = Result<HashMap<String, f64>, std::io::Error>;
     
     fn next(&mut self) -> Option<Self::Item> {
-        let mut line = String::new();
-        match self.reader.read_line(&mut line) {
-            Ok(0) => None, // EOF
-            Ok(_) => {
-                let parsed = StrapTrack::parse_line(&line,self.all);
-                Some(Ok(parsed))
-            }
-            Err(e) => Some(Err(e)),
+        loop {
+            let mut line = String::new();
+            match self.reader.read_line(&mut line) {
+                Ok(0) => return None, // EOF
+                Ok(_) => {
+                    let parsed = StrapTrack::parse_line(&line,self.all);
+                    if let Some(p) = parsed {
+                        return Some(Ok(p));
+                    }
+                    // continue until we find a valid line
+                }
+                Err(e) => return Some(Err(e)),
+            };
         }
     }
 }
@@ -69,14 +74,19 @@ impl Iterator for StrapTrackIterator {
     type Item = Result<HashMap<String, f64>, std::io::Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let mut line = String::new();
-        match self.reader.read_line(&mut line) {
-            Ok(0) => None, // EOF
-            Ok(_) => {
-                let parsed = StrapTrack::parse_line(&line, self.all);
-                Some(Ok(parsed))
-            }
-            Err(e) => Some(Err(e)),
+        loop {
+            let mut line = String::new();
+            match self.reader.read_line(&mut line) {
+                Ok(0) => return None, // EOF
+                Ok(_) => {
+                    let parsed = StrapTrack::parse_line(&line, self.all);
+                    if let Some(p) = parsed {
+                        return Some(Ok(p));
+                    }
+                    // continue until we find a valid line
+                }
+                Err(e) => return Some(Err(e)),
+            };
         }
     }
 }
@@ -152,7 +162,7 @@ impl StrapTrack {
     }
 
     /// Parse a single STRAP line into key-value pairs
-    fn parse_line(line: &str, all: bool) -> HashMap<String, f64> {
+    fn parse_line(line: &str, all: bool) -> Option<HashMap<String, f64>> {
         let mut result = HashMap::new();
         let line = line.trim();
 
@@ -170,7 +180,7 @@ impl StrapTrack {
             if all {
                 line
             } else {
-                return result; // Empty
+                return None; // Empty
             }
         };
 
@@ -184,19 +194,18 @@ impl StrapTrack {
             }
         }
 
-        result
+        Some(result)
+    }
+
+    pub fn is_all(&self) -> bool {
+        let path_str = self.file_path.to_string_lossy().to_lowercase();
+        path_str.ends_with(".strap") || path_str.ends_with(".strap.gz") || path_str.ends_with(".strap.gzip") || path_str.ends_with(".strap.zst") || path_str.ends_with(".strap.zstd") || path_str.ends_with(".strap.zip")
     }
 
     /// Returns an iterator over all rows
     pub fn iter(&self) -> Result<StrapTrackIterator, std::io::Error> {
         // check if file name contains .strap or .strap.gz etc
-        let path_str = self.file_path.to_string_lossy().to_lowercase();
-        let all = path_str.ends_with(".strap")
-            || path_str.ends_with(".strap.gz")
-            || path_str.ends_with(".strap.gzip")
-            || path_str.ends_with(".strap.zst")
-            || path_str.ends_with(".strap.zstd")
-            || path_str.ends_with(".strap.zip");
+        let all = self.is_all();
         let reader = self.create_reader()?;
         Ok(StrapTrackIterator { all, reader })
     }
@@ -254,7 +263,7 @@ impl StrapTrack {
         column_names: std::collections::HashSet<String>,
         filename: &str,
         schema_changes: usize,
-    ) -> Result<(Arc<Schema>, ArrowWriter<File>), Box<dyn std::error::Error>> {
+    ) -> Result<(Arc<Schema>, ArrowWriter<File>), Box<dyn std::error::Error + Send + Sync>> {
         let mut column_names: Vec<_> = column_names.into_iter().collect();
         column_names.sort();
         // 2. Build new schema
@@ -270,12 +279,12 @@ impl StrapTrack {
         return Ok((schema, writer));
     }
 
-    pub fn strap_to_parquet<R: BufRead, W: Write>(
+    pub fn strap_to_parquet<R: BufRead>(
         reader: R,
         all: bool,
         filename: &str, // only filename, since we will write temp files
         chunk_size: usize,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // changing when the schema changes:
         let mut column_names = std::collections::HashSet::new();
         let (mut schema, mut writer) = StrapTrack::make_new_schema_and_writer(column_names.clone(), filename, 0)?;
@@ -317,6 +326,12 @@ impl StrapTrack {
         }
         writer.close()?;
 
+        if schema_changes == 1 {
+            // if there was only one schema change, we can just rename the temp file to the final file
+            std::fs::rename(StrapTrack::name_parquet_file(filename, 1), filename)?;
+            return Ok(());
+        }
+
         (schema,writer) = StrapTrack::make_new_schema_and_writer(column_names.clone(), filename, 0)?;
         for i in 1..=schema_changes {
         let file = File::open(StrapTrack::name_parquet_file(filename, i))?;
@@ -356,6 +371,17 @@ impl StrapTrack {
         // now we merge the temp files into one final file
 
         Ok(())
+    }
+    /// Convert STRAP data to Parquet format
+    pub fn new_to_parquet(
+        &self,
+        filename: impl AsRef<Path>,
+        chunk_size: usize,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // call strap_to_parquet with the reader
+        let reader = self.create_reader()?;
+        let filen: &str = filename.as_ref().file_name().unwrap().to_str().unwrap();
+        StrapTrack::strap_to_parquet(reader, self.is_all(), filen, chunk_size)
     }
 
     /// Convert STRAP data to Parquet format

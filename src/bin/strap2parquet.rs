@@ -25,7 +25,7 @@ fn main() -> anyhow::Result<()> {
                 .long("chunk-size")
                 .help("Number of rows to buffer per parquet batch")
                 .value_parser(value_parser!(usize))
-                .default_value("1000"),
+                .default_value("2048"),
         )
         .get_matches();
 

@@ -1,4 +1,4 @@
-use core::{hash, panic};
+use core::{panic};
 use std::fmt::{Display, Formatter, Result as FmtResult};
 use std::{
     collections::HashMap,
@@ -563,7 +563,7 @@ impl eframe::App for MyApp {
                                                 filters: curve.filter.clone(),
                                         }));
                                     }
-                                    if let(Some(stat)) = &self.histogram_view.stat {
+                                    if let Some(stat) = &self.histogram_view.stat {
                                         draw_stat(
                                             ui,
                                             stat,
@@ -600,7 +600,7 @@ impl eframe::App for MyApp {
                 egui::CollapsingHeader::new(format!("SQL History ({} queries)", self.sql.history.len()))
                     .default_open(true)
                     .show(ui, |ui| {
-                                for ((i,query, error)) in self.sql.history.iter().rev() {
+                                for (i,query, error) in self.sql.history.iter().rev() {
                                     ui.push_id(i, |ui| {
                                         // Show query number and status
                                         let status_text = if error.is_some() {

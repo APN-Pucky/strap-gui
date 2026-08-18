@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use std::fs::File;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use std::sync::Arc;
@@ -46,11 +46,9 @@ fn parse_line(line: &str, all: bool) -> Option<HashMap<String, f64>> {
 
     // Parse key-value pairs separated by whitespace
     let tokens: Vec<&str> = line.split_whitespace().collect();
-    for chunk in tokens.chunks(2) {
-        if chunk.len() == 2 {
-            if let Ok(value) = chunk[1].parse::<f64>() {
-                result.insert(chunk[0].to_string(), value);
-            }
+    for chunk in tokens.chunks(2)  {
+        if chunk.len() == 2 && let Ok(value) = chunk[1].parse::<f64>() {
+            result.insert(chunk[0].to_string(), value);
         }
     }
 
@@ -68,7 +66,7 @@ pub fn name_parquet_file(filename: &str, schema_changes: usize) -> String {
     if schema_changes == 0 {
         return filename.to_string();
     }
-    format!("temp_{}_{}", filename, schema_changes)
+    format!("{}_temp_{}", filename, schema_changes)
 }
 
 pub fn make_new_schema_and_writer(
@@ -88,7 +86,7 @@ pub fn make_new_schema_and_writer(
     let file = File::create(name_parquet_file(filename, schema_changes))?;
     let props = WriterProperties::builder().build();
     let writer = ArrowWriter::try_new(file, schema.clone(), Some(props))?;
-    return Ok((schema, writer));
+    Ok((schema, writer))
 }
 
 pub fn convert_to_parquet(
@@ -297,7 +295,7 @@ impl StrapTrack {
             let mut archive = ZipArchive::new(file)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
-            if archive.len() == 0 {
+            if archive.is_empty() {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     "ZIP archive is empty",
@@ -363,7 +361,7 @@ impl StrapTrack {
     {
         let mut results = Vec::new();
         self.for_each_row(|row| {
-            if predicate(&row) {
+            if predicate(row) {
                 results.push(row.clone());
             }
             true // continue

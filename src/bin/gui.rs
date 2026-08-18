@@ -15,7 +15,7 @@ use strum::IntoEnumIterator;
 use strum_macros::{Display, EnumIter};
 
 use straptrack::{
-    DEFAULT_PARQUET_CHUNK_SIZE, StrapTrack, convert_to_parquet, default_parquet_path,
+    DEFAULT_PARQUET_CHUNK_SIZE, convert_to_parquet, default_parquet_path,
 };
 
 #[derive(Hash, Eq, PartialEq, Clone)]

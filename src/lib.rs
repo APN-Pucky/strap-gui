@@ -6,7 +6,6 @@ use std::path::{Path, PathBuf};
 
 use std::sync::Arc;
 
-use egui::Key::C;
 use flate2::bufread::GzDecoder;
 use itertools::Itertools;
 
@@ -20,6 +19,43 @@ use zip::ZipArchive;
 use zstd::stream::read::Decoder as ZstdDecoder;
 
 pub const DEFAULT_PARQUET_CHUNK_SIZE: usize = 2048;
+
+
+/// Parse a single STRAP line into key-value pairs
+fn parse_line(line: &str, all: bool) -> Option<HashMap<String, f64>> {
+    let mut result = HashMap::new();
+    let line = line.trim();
+
+    // Handle @strap prefix - find first occurrence and continue from there
+    let line = if let Some(pos) = line.find("@strap") {
+        // Skip past "@strap" and any following digit/space
+        let after_strap = &line[pos..]; // Skip "@strap"
+        if let Some(pos) = after_strap.find(char::is_whitespace) {
+            &after_strap[pos..]
+        } else {
+            after_strap
+        }
+        .trim_start() // Remove any leading whitespace
+    } else {
+        if all {
+            line
+        } else {
+            return None; // Empty
+        }
+    };
+
+    // Parse key-value pairs separated by whitespace
+    let tokens: Vec<&str> = line.split_whitespace().collect();
+    for chunk in tokens.chunks(2) {
+        if chunk.len() == 2 {
+            if let Ok(value) = chunk[1].parse::<f64>() {
+                result.insert(chunk[0].to_string(), value);
+            }
+        }
+    }
+
+    Some(result)
+}
 
 pub fn default_parquet_path(path: impl AsRef<Path>) -> PathBuf {
     let mut output = path.as_ref().as_os_str().to_os_string();
@@ -50,7 +86,7 @@ impl<R: BufRead> Iterator for StrapIterator<R> {
             match self.reader.read_line(&mut line) {
                 Ok(0) => return None, // EOF
                 Ok(_) => {
-                    let parsed = StrapTrack::parse_line(&line,self.all);
+                    let parsed = parse_line(&line, self.all);
                     if let Some(p) = parsed {
                         return Some(Ok(p));
                     }
@@ -60,6 +96,100 @@ impl<R: BufRead> Iterator for StrapIterator<R> {
             };
         }
     }
+}
+
+pub fn strap_to_parquet<R: BufRead>(
+    reader: R,
+    all: bool,
+    filename: &str, // only filename, since we will write temp files
+    chunk_size: usize,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // changing when the schema changes:
+    let mut column_names = std::collections::HashSet::new();
+    let (mut schema, mut writer) = StrapTrack::make_new_schema_and_writer(column_names.clone(), filename, 0)?;
+    let mut schema_changes = 0;
+
+
+    let iter = StrapIterator { all, reader };
+    for vhm in &iter.chunks(chunk_size) {
+        let chunk_data: Result<Vec<_>, _> = vhm.collect();
+        let chunk_data = chunk_data?;
+        let mut found_new_columns = false;
+        for hm in &chunk_data {
+            for key in hm.keys() {
+                if column_names.insert(key.clone()) {
+                    found_new_columns = true;
+                }
+            }
+        }
+        if found_new_columns {
+            schema_changes += 1;
+            writer.close()?;
+            (schema,writer) = StrapTrack::make_new_schema_and_writer(column_names.clone(), filename, schema_changes)?;
+        }
+                    
+        // 3. Build arrays
+        let mut arrays: Vec<ArrayRef> = Vec::new();
+        for col in &column_names {
+            let values: Vec<Option<f64>> = chunk_data.iter()
+                .map(|row| row.get(col).copied())
+                .collect();
+            arrays.push(Arc::new(Float64Array::from(values)) as ArrayRef);
+        }
+
+
+        // 4. Build RecordBatch
+        let batch = RecordBatch::try_new(schema.clone(), arrays)?;
+        // 5. Write Parquet
+        writer.write(&batch)?;
+    }
+    writer.close()?;
+
+    if schema_changes == 1 {
+        // if there was only one schema change, we can just rename the temp file to the final file
+        std::fs::rename(StrapTrack::name_parquet_file(filename, 1), filename)?;
+        return Ok(());
+    }
+
+    (schema,writer) = StrapTrack::make_new_schema_and_writer(column_names.clone(), filename, 0)?;
+    for i in 1..=schema_changes {
+    let file = File::open(StrapTrack::name_parquet_file(filename, i))?;
+
+    let reader = ParquetRecordBatchReaderBuilder::try_new(file)?
+        .build()?;
+
+    for batch in reader {
+        let batch = batch?;
+
+        let arrays: Vec<ArrayRef> = schema
+            .fields()
+            .iter()
+            .map(|field| {
+                match batch.schema().index_of(field.name()) {
+                    Ok(index) => batch.column(index).clone(),
+
+                    Err(_) => {
+                        new_null_array(
+                            field.data_type(),
+                            batch.num_rows(),
+                        )
+                    }
+                }
+            })
+            .collect();
+
+        let batch =
+            RecordBatch::try_new(schema.clone(), arrays)?;
+
+        writer.write(&batch)?;
+    }
+}
+
+writer.close()?;
+
+    // now we merge the temp files into one final file
+
+    Ok(())
 }
 
 
@@ -79,7 +209,7 @@ impl Iterator for StrapTrackIterator {
             match self.reader.read_line(&mut line) {
                 Ok(0) => return None, // EOF
                 Ok(_) => {
-                    let parsed = StrapTrack::parse_line(&line, self.all);
+                    let parsed = parse_line(&line, self.all);
                     if let Some(p) = parsed {
                         return Some(Ok(p));
                     }
@@ -90,6 +220,9 @@ impl Iterator for StrapTrackIterator {
         }
     }
 }
+
+/////////////////////////////////////////////
+/// Everything below is legacy code that is not used in the new streaming implementation, but is kept for reference and testing.
 
 /// Lazy/streaming parser for STRAP protocol files
 #[derive(Debug)]
@@ -161,41 +294,6 @@ impl StrapTrack {
         Ok(unique_keys.into_iter().collect())
     }
 
-    /// Parse a single STRAP line into key-value pairs
-    fn parse_line(line: &str, all: bool) -> Option<HashMap<String, f64>> {
-        let mut result = HashMap::new();
-        let line = line.trim();
-
-        // Handle @strap prefix - find first occurrence and continue from there
-        let line = if let Some(pos) = line.find("@strap") {
-            // Skip past "@strap" and any following digit/space
-            let after_strap = &line[pos..]; // Skip "@strap"
-            if let Some(pos) = after_strap.find(char::is_whitespace) {
-                &after_strap[pos..]
-            } else {
-                after_strap
-            }
-            .trim_start() // Remove any leading whitespace
-        } else {
-            if all {
-                line
-            } else {
-                return None; // Empty
-            }
-        };
-
-        // Parse key-value pairs separated by whitespace
-        let tokens: Vec<&str> = line.split_whitespace().collect();
-        for chunk in tokens.chunks(2) {
-            if chunk.len() == 2 {
-                if let Ok(value) = chunk[1].parse::<f64>() {
-                    result.insert(chunk[0].to_string(), value);
-                }
-            }
-        }
-
-        Some(result)
-    }
 
     pub fn is_all(&self) -> bool {
         let path_str = self.file_path.to_string_lossy().to_lowercase();
@@ -279,99 +377,7 @@ impl StrapTrack {
         return Ok((schema, writer));
     }
 
-    pub fn strap_to_parquet<R: BufRead>(
-        reader: R,
-        all: bool,
-        filename: &str, // only filename, since we will write temp files
-        chunk_size: usize,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // changing when the schema changes:
-        let mut column_names = std::collections::HashSet::new();
-        let (mut schema, mut writer) = StrapTrack::make_new_schema_and_writer(column_names.clone(), filename, 0)?;
-        let mut schema_changes = 0;
 
-
-        let iter = StrapIterator { all, reader };
-        for vhm in &iter.chunks(chunk_size) {
-            let chunk_data: Result<Vec<_>, _> = vhm.collect();
-            let chunk_data = chunk_data?;
-            let mut found_new_columns = false;
-            for hm in &chunk_data {
-                for key in hm.keys() {
-                    if column_names.insert(key.clone()) {
-                        found_new_columns = true;
-                    }
-                }
-            }
-            if found_new_columns {
-                schema_changes += 1;
-                writer.close()?;
-                (schema,writer) = StrapTrack::make_new_schema_and_writer(column_names.clone(), filename, schema_changes)?;
-            }
-                        
-            // 3. Build arrays
-            let mut arrays: Vec<ArrayRef> = Vec::new();
-            for col in &column_names {
-                let values: Vec<Option<f64>> = chunk_data.iter()
-                    .map(|row| row.get(col).copied())
-                    .collect();
-                arrays.push(Arc::new(Float64Array::from(values)) as ArrayRef);
-            }
-
-
-            // 4. Build RecordBatch
-            let batch = RecordBatch::try_new(schema.clone(), arrays)?;
-            // 5. Write Parquet
-            writer.write(&batch)?;
-        }
-        writer.close()?;
-
-        if schema_changes == 1 {
-            // if there was only one schema change, we can just rename the temp file to the final file
-            std::fs::rename(StrapTrack::name_parquet_file(filename, 1), filename)?;
-            return Ok(());
-        }
-
-        (schema,writer) = StrapTrack::make_new_schema_and_writer(column_names.clone(), filename, 0)?;
-        for i in 1..=schema_changes {
-        let file = File::open(StrapTrack::name_parquet_file(filename, i))?;
-
-        let reader = ParquetRecordBatchReaderBuilder::try_new(file)?
-            .build()?;
-
-        for batch in reader {
-            let batch = batch?;
-
-            let arrays: Vec<ArrayRef> = schema
-                .fields()
-                .iter()
-                .map(|field| {
-                    match batch.schema().index_of(field.name()) {
-                        Ok(index) => batch.column(index).clone(),
-
-                        Err(_) => {
-                            new_null_array(
-                                field.data_type(),
-                                batch.num_rows(),
-                            )
-                        }
-                    }
-                })
-                .collect();
-
-            let batch =
-                RecordBatch::try_new(schema.clone(), arrays)?;
-
-            writer.write(&batch)?;
-        }
-    }
-
-    writer.close()?;
-
-        // now we merge the temp files into one final file
-
-        Ok(())
-    }
     /// Convert STRAP data to Parquet format
     pub fn to_parquet(
         &self,
@@ -381,7 +387,7 @@ impl StrapTrack {
         // call strap_to_parquet with the reader
         let reader = self.create_reader()?;
         let filen: &str = filename.as_ref().file_name().unwrap().to_str().unwrap();
-        StrapTrack::strap_to_parquet(reader, self.is_all(), filen, chunk_size)
+        strap_to_parquet(reader, self.is_all(), filen, chunk_size)
     }
 
     /// Convert STRAP data to Parquet format
@@ -444,35 +450,35 @@ mod tests {
 
     #[test]
     fn test_parse_simple_line() {
-        let result = StrapTrack::parse_line("alice_sword 2.2 bob_bow 5.0", true).unwrap();
+        let result = parse_line("alice_sword 2.2 bob_bow 5.0", true).unwrap();
         assert_eq!(result.get("alice_sword"), Some(&2.2));
         assert_eq!(result.get("bob_bow"), Some(&5.0));
-        let result = StrapTrack::parse_line("alice_sword 2.2 bob_bow 5.0", false);
+        let result = parse_line("alice_sword 2.2 bob_bow 5.0", false);
         // assert empty since no @strap prefix
         assert!(result.is_none());
     }
 
     #[test]
     fn test_parse_strap_prefix() {
-        let result = StrapTrack::parse_line("@strap damage 15.0 attacker_alice 1.0", true).unwrap();
+        let result = parse_line("@strap damage 15.0 attacker_alice 1.0", true).unwrap();
         assert_eq!(result.get("damage"), Some(&15.0));
         assert_eq!(result.get("attacker_alice"), Some(&1.0));
-        let result = StrapTrack::parse_line("@strap damage 15.0 attacker_alice 1.0", false).unwrap();
+        let result = parse_line("@strap damage 15.0 attacker_alice 1.0", false).unwrap();
         assert_eq!(result.get("damage"), Some(&15.0));
         assert_eq!(result.get("attacker_alice"), Some(&1.0));
     }
 
     #[test]
     fn test_parse_strap1_prefix() {
-        let result = StrapTrack::parse_line("@strap1 line 5.0", true).unwrap();
+        let result = parse_line("@strap1 line 5.0", true).unwrap();
         assert_eq!(result.get("line"), Some(&5.0));
-        let result = StrapTrack::parse_line("@strap1 line 5.0", false).unwrap();
+        let result = parse_line("@strap1 line 5.0", false).unwrap();
         assert_eq!(result.get("line"), Some(&5.0));
     }
 
     #[test]
     fn test_parse_strap_with_metadata() {
-        let result = StrapTrack::parse_line(
+        let result = parse_line(
             "DATE TIME OR OTHER_METADATA @strap damage 15.0 attacker_alice 1.0 defender_bob 1.0",
             false,
         ).unwrap();
@@ -483,35 +489,35 @@ mod tests {
 
     #[test]
     fn test_parse_empty_line() {
-        let result = StrapTrack::parse_line("", true).unwrap();
+        let result = parse_line("", true).unwrap();
         assert!(result.is_empty());
-        let result = StrapTrack::parse_line("", false);
+        let result = parse_line("", false);
         assert!(result.is_none());
     }
 
     #[test]
     fn test_parse_whitespace_only() {
-        let result = StrapTrack::parse_line("   \t  ", true).unwrap();
+        let result = parse_line("   \t  ", true).unwrap();
         assert!(result.is_empty());
-        let result = StrapTrack::parse_line("   \t  ", false);
+        let result = parse_line("   \t  ", false);
         assert!(result.is_none());
     }
 
     #[test]
     fn test_parse_odd_number_tokens() {
-        let result = StrapTrack::parse_line("key1 1.0 key2", true).unwrap();
+        let result = parse_line("key1 1.0 key2", true).unwrap();
         assert_eq!(result.get("key1"), Some(&1.0));
         assert!(!result.contains_key("key2"));
-        let result = StrapTrack::parse_line("key1 1.0 key2", false);
+        let result = parse_line("key1 1.0 key2", false);
         assert!(result.is_none());
     }
 
     #[test]
     fn test_parse_invalid_float() {
-        let result = StrapTrack::parse_line("key1 invalid_float key2 2.0", true).unwrap();
+        let result = parse_line("key1 invalid_float key2 2.0", true).unwrap();
         assert!(!result.contains_key("key1"));
         assert_eq!(result.get("key2"), Some(&2.0));
-        let result = StrapTrack::parse_line("key1 invalid_float key2 2.0", false);
+        let result = parse_line("key1 invalid_float key2 2.0", false);
         assert!(result.is_none());
     }
 
@@ -587,20 +593,20 @@ mod tests {
 
     #[test]
     fn test_strap_with_digits() {
-        let result = StrapTrack::parse_line("@strap2 key 1.0", false).unwrap();
+        let result = parse_line("@strap2 key 1.0", false).unwrap();
         assert_eq!(result.get("key"), Some(&1.0));
     }
 
     #[test]
     fn test_scientific_notation() {
-        let result = StrapTrack::parse_line("temp 3.14e2 pressure 1.01e5", true).unwrap();
+        let result = parse_line("temp 3.14e2 pressure 1.01e5", true).unwrap();
         assert_eq!(result.get("temp"), Some(&314.0));
         assert_eq!(result.get("pressure"), Some(&101000.0));
     }
 
     #[test]
     fn test_negative_values() {
-        let result = StrapTrack::parse_line("deficit -42.5 surplus 100.0", true).unwrap();
+        let result = parse_line("deficit -42.5 surplus 100.0", true).unwrap();
         assert_eq!(result.get("deficit"), Some(&-42.5));
         assert_eq!(result.get("surplus"), Some(&100.0));
     }

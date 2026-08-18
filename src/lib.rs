@@ -63,6 +63,34 @@ pub fn default_parquet_path(path: impl AsRef<Path>) -> PathBuf {
     PathBuf::from(output)
 }
 
+
+pub fn name_parquet_file(filename: &str, schema_changes: usize) -> String {
+    if schema_changes == 0 {
+        return filename.to_string();
+    }
+    format!("temp_{}_{}", filename, schema_changes)
+}
+
+pub fn make_new_schema_and_writer(
+    column_names: std::collections::HashSet<String>,
+    filename: &str,
+    schema_changes: usize,
+) -> Result<(Arc<Schema>, ArrowWriter<File>), Box<dyn std::error::Error + Send + Sync>> {
+    let mut column_names: Vec<_> = column_names.into_iter().collect();
+    column_names.sort();
+    // 2. Build new schema
+    let fields: Vec<Field> = column_names.iter()
+        .map(|name| Field::new(name, DataType::Float64, true)) // nullable = true
+        .collect();
+    let schema = Arc::new(Schema::new(fields));
+
+    // Setup Parquet writer
+    let file = File::create(name_parquet_file(filename, schema_changes))?;
+    let props = WriterProperties::builder().build();
+    let writer = ArrowWriter::try_new(file, schema.clone(), Some(props))?;
+    return Ok((schema, writer));
+}
+
 pub fn convert_to_parquet(
     input_path: impl AsRef<Path>,
     output_path: impl AsRef<Path>,
@@ -106,7 +134,7 @@ pub fn strap_to_parquet<R: BufRead>(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // changing when the schema changes:
     let mut column_names = std::collections::HashSet::new();
-    let (mut schema, mut writer) = StrapTrack::make_new_schema_and_writer(column_names.clone(), filename, 0)?;
+    let (mut schema, mut writer) = make_new_schema_and_writer(column_names.clone(), filename, 0)?;
     let mut schema_changes = 0;
 
 
@@ -125,12 +153,13 @@ pub fn strap_to_parquet<R: BufRead>(
         if found_new_columns {
             schema_changes += 1;
             writer.close()?;
-            (schema,writer) = StrapTrack::make_new_schema_and_writer(column_names.clone(), filename, schema_changes)?;
+            (schema,writer) = make_new_schema_and_writer(column_names.clone(), filename, schema_changes)?;
         }
                     
         // 3. Build arrays
         let mut arrays: Vec<ArrayRef> = Vec::new();
-        for col in &column_names {
+        for field in schema.fields(){
+            let col = field.name();
             let values: Vec<Option<f64>> = chunk_data.iter()
                 .map(|row| row.get(col).copied())
                 .collect();
@@ -146,16 +175,19 @@ pub fn strap_to_parquet<R: BufRead>(
     writer.close()?;
 
     if schema_changes == 1 {
+        // winodws hack: delete the temp file before renaming, since windows doesn't allow renaming over an existing file
+        // the better solution would be to have writer and scheme above as Option, but that makes the code very ugly
+        let _ = std::fs::remove_file(filename);
         // if there was only one schema change, we can just rename the temp file to the final file
-        std::fs::rename(StrapTrack::name_parquet_file(filename, 1), filename)?;
+        std::fs::rename(name_parquet_file(filename, 1), filename)?;
         return Ok(());
     }
 
     // now we merge the temp files into one final file
 
-    (schema,writer) = StrapTrack::make_new_schema_and_writer(column_names.clone(), filename, 0)?;
+    (schema,writer) = make_new_schema_and_writer(column_names.clone(), filename, 0)?;
     for i in 1..=schema_changes {
-        let file = File::open(StrapTrack::name_parquet_file(filename, i))?;
+        let file = File::open(name_parquet_file(filename, i))?;
 
         let reader = ParquetRecordBatchReaderBuilder::try_new(file)?
             .build()?;
@@ -186,7 +218,7 @@ pub fn strap_to_parquet<R: BufRead>(
             writer.write(&batch)?;
         }
         // delete the temp file
-        std::fs::remove_file(StrapTrack::name_parquet_file(filename, i))?;
+        std::fs::remove_file(name_parquet_file(filename, i))?;
     }
 
     writer.close()?;
@@ -353,32 +385,6 @@ impl StrapTrack {
         Ok(acc)
     }
 
-    pub fn name_parquet_file(filename: &str, schema_changes: usize) -> String {
-        if schema_changes == 0 {
-            return filename.to_string();
-        }
-        format!("temp_{}_{}", filename, schema_changes)
-    }
-
-    pub fn make_new_schema_and_writer(
-        column_names: std::collections::HashSet<String>,
-        filename: &str,
-        schema_changes: usize,
-    ) -> Result<(Arc<Schema>, ArrowWriter<File>), Box<dyn std::error::Error + Send + Sync>> {
-        let mut column_names: Vec<_> = column_names.into_iter().collect();
-        column_names.sort();
-        // 2. Build new schema
-        let fields: Vec<Field> = column_names.iter()
-            .map(|name| Field::new(name, DataType::Float64, true)) // nullable = true
-            .collect();
-        let schema = Arc::new(Schema::new(fields));
-
-        // Setup Parquet writer
-        let file = File::create(StrapTrack::name_parquet_file(filename, schema_changes))?;
-        let props = WriterProperties::builder().build();
-        let writer = ArrowWriter::try_new(file, schema.clone(), Some(props))?;
-        return Ok((schema, writer));
-    }
 
 
     /// Convert STRAP data to Parquet format
@@ -389,7 +395,7 @@ impl StrapTrack {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // call strap_to_parquet with the reader
         let reader = self.create_reader()?;
-        let filen: &str = filename.as_ref().file_name().unwrap().to_str().unwrap();
+        let filen = &filename.as_ref().to_string_lossy().into_owned();
         strap_to_parquet(reader, self.is_all(), filen, chunk_size)
     }
 

@@ -1,18 +1,20 @@
 use std::collections::HashMap;
 
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
 use std::sync::Arc;
 
+use egui::Key::C;
 use flate2::bufread::GzDecoder;
 use itertools::Itertools;
 
-use arrow::array::{ArrayRef, Float64Array};
+use arrow::array::{Float64Array, ArrayRef, new_null_array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::file::properties::WriterProperties;
 use zip::ZipArchive;
 use zstd::stream::read::Decoder as ZstdDecoder;
@@ -33,6 +35,29 @@ pub fn convert_to_parquet(
     let track = StrapTrack::new(input_path.as_ref())?;
     track.to_parquet(output_path.as_ref(), chunk_size)
 }
+/// Iterator over STRAP file rows
+pub struct StrapIterator<R: BufRead> {
+    all:bool,
+    reader: R,
+}
+
+impl<R: BufRead> Iterator for StrapIterator<R> {
+    type Item = Result<HashMap<String, f64>, std::io::Error>;
+    
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut line = String::new();
+        match self.reader.read_line(&mut line) {
+            Ok(0) => None, // EOF
+            Ok(_) => {
+                let parsed = StrapTrack::parse_line(&line,self.all);
+                Some(Ok(parsed))
+            }
+            Err(e) => Some(Err(e)),
+        }
+    }
+}
+
+
 
 /// Iterator over STRAP file rows
 pub struct StrapTrackIterator {
@@ -216,6 +241,121 @@ impl StrapTrack {
         }
 
         Ok(acc)
+    }
+
+    pub fn name_parquet_file(filename: &str, schema_changes: usize) -> String {
+        if schema_changes == 0 {
+            return filename.to_string();
+        }
+        format!("temp_{}_{}", filename, schema_changes)
+    }
+
+    pub fn make_new_schema_and_writer(
+        column_names: std::collections::HashSet<String>,
+        filename: &str,
+        schema_changes: usize,
+    ) -> Result<(Arc<Schema>, ArrowWriter<File>), Box<dyn std::error::Error>> {
+        let mut column_names: Vec<_> = column_names.into_iter().collect();
+        column_names.sort();
+        // 2. Build new schema
+        let fields: Vec<Field> = column_names.iter()
+            .map(|name| Field::new(name, DataType::Float64, true)) // nullable = true
+            .collect();
+        let schema = Arc::new(Schema::new(fields));
+
+        // Setup Parquet writer
+        let file = File::create(StrapTrack::name_parquet_file(filename, schema_changes))?;
+        let props = WriterProperties::builder().build();
+        let writer = ArrowWriter::try_new(file, schema.clone(), Some(props))?;
+        return Ok((schema, writer));
+    }
+
+    pub fn strap_to_parquet<R: BufRead, W: Write>(
+        reader: R,
+        all: bool,
+        filename: &str, // only filename, since we will write temp files
+        chunk_size: usize,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // changing when the schema changes:
+        let mut column_names = std::collections::HashSet::new();
+        let (mut schema, mut writer) = StrapTrack::make_new_schema_and_writer(column_names.clone(), filename, 0)?;
+        let mut schema_changes = 0;
+
+
+        let iter = StrapIterator { all, reader };
+        for vhm in &iter.chunks(chunk_size) {
+            let chunk_data: Result<Vec<_>, _> = vhm.collect();
+            let chunk_data = chunk_data?;
+            let mut found_new_columns = false;
+            for hm in &chunk_data {
+                for key in hm.keys() {
+                    if column_names.insert(key.clone()) {
+                        found_new_columns = true;
+                    }
+                }
+            }
+            if found_new_columns {
+                schema_changes += 1;
+                writer.close()?;
+                (schema,writer) = StrapTrack::make_new_schema_and_writer(column_names.clone(), filename, schema_changes)?;
+            }
+                        
+            // 3. Build arrays
+            let mut arrays: Vec<ArrayRef> = Vec::new();
+            for col in &column_names {
+                let values: Vec<Option<f64>> = chunk_data.iter()
+                    .map(|row| row.get(col).copied())
+                    .collect();
+                arrays.push(Arc::new(Float64Array::from(values)) as ArrayRef);
+            }
+
+
+            // 4. Build RecordBatch
+            let batch = RecordBatch::try_new(schema.clone(), arrays)?;
+            // 5. Write Parquet
+            writer.write(&batch)?;
+        }
+        writer.close()?;
+
+        (schema,writer) = StrapTrack::make_new_schema_and_writer(column_names.clone(), filename, 0)?;
+        for i in 1..=schema_changes {
+        let file = File::open(StrapTrack::name_parquet_file(filename, i))?;
+
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file)?
+            .build()?;
+
+        for batch in reader {
+            let batch = batch?;
+
+            let arrays: Vec<ArrayRef> = schema
+                .fields()
+                .iter()
+                .map(|field| {
+                    match batch.schema().index_of(field.name()) {
+                        Ok(index) => batch.column(index).clone(),
+
+                        Err(_) => {
+                            new_null_array(
+                                field.data_type(),
+                                batch.num_rows(),
+                            )
+                        }
+                    }
+                })
+                .collect();
+
+            let batch =
+                RecordBatch::try_new(schema.clone(), arrays)?;
+
+            writer.write(&batch)?;
+        }
+    }
+
+    writer.close()?;
+
+        // now we merge the temp files into one final file
+
+        Ok(())
     }
 
     /// Convert STRAP data to Parquet format

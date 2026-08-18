@@ -444,29 +444,29 @@ mod tests {
 
     #[test]
     fn test_parse_simple_line() {
-        let result = StrapTrack::parse_line("alice_sword 2.2 bob_bow 5.0", true);
+        let result = StrapTrack::parse_line("alice_sword 2.2 bob_bow 5.0", true).unwrap();
         assert_eq!(result.get("alice_sword"), Some(&2.2));
         assert_eq!(result.get("bob_bow"), Some(&5.0));
         let result = StrapTrack::parse_line("alice_sword 2.2 bob_bow 5.0", false);
         // assert empty since no @strap prefix
-        assert!(result.is_empty());
+        assert!(result.is_none());
     }
 
     #[test]
     fn test_parse_strap_prefix() {
-        let result = StrapTrack::parse_line("@strap damage 15.0 attacker_alice 1.0", true);
+        let result = StrapTrack::parse_line("@strap damage 15.0 attacker_alice 1.0", true).unwrap();
         assert_eq!(result.get("damage"), Some(&15.0));
         assert_eq!(result.get("attacker_alice"), Some(&1.0));
-        let result = StrapTrack::parse_line("@strap damage 15.0 attacker_alice 1.0", false);
+        let result = StrapTrack::parse_line("@strap damage 15.0 attacker_alice 1.0", false).unwrap();
         assert_eq!(result.get("damage"), Some(&15.0));
         assert_eq!(result.get("attacker_alice"), Some(&1.0));
     }
 
     #[test]
     fn test_parse_strap1_prefix() {
-        let result = StrapTrack::parse_line("@strap1 line 5.0", true);
+        let result = StrapTrack::parse_line("@strap1 line 5.0", true).unwrap();
         assert_eq!(result.get("line"), Some(&5.0));
-        let result = StrapTrack::parse_line("@strap1 line 5.0", false);
+        let result = StrapTrack::parse_line("@strap1 line 5.0", false).unwrap();
         assert_eq!(result.get("line"), Some(&5.0));
     }
 
@@ -475,7 +475,7 @@ mod tests {
         let result = StrapTrack::parse_line(
             "DATE TIME OR OTHER_METADATA @strap damage 15.0 attacker_alice 1.0 defender_bob 1.0",
             false,
-        );
+        ).unwrap();
         assert_eq!(result.get("damage"), Some(&15.0));
         assert_eq!(result.get("attacker_alice"), Some(&1.0));
         assert_eq!(result.get("defender_bob"), Some(&1.0));
@@ -483,32 +483,36 @@ mod tests {
 
     #[test]
     fn test_parse_empty_line() {
-        let result = StrapTrack::parse_line("", true);
+        let result = StrapTrack::parse_line("", true).unwrap();
         assert!(result.is_empty());
+        let result = StrapTrack::parse_line("", false);
+        assert!(result.is_none());
     }
 
     #[test]
     fn test_parse_whitespace_only() {
-        let result = StrapTrack::parse_line("   \t  ", true);
+        let result = StrapTrack::parse_line("   \t  ", true).unwrap();
         assert!(result.is_empty());
+        let result = StrapTrack::parse_line("   \t  ", false);
+        assert!(result.is_none());
     }
 
     #[test]
     fn test_parse_odd_number_tokens() {
-        let result = StrapTrack::parse_line("key1 1.0 key2", true);
+        let result = StrapTrack::parse_line("key1 1.0 key2", true).unwrap();
         assert_eq!(result.get("key1"), Some(&1.0));
         assert!(!result.contains_key("key2"));
         let result = StrapTrack::parse_line("key1 1.0 key2", false);
-        assert!(result.is_empty());
+        assert!(result.is_none());
     }
 
     #[test]
     fn test_parse_invalid_float() {
-        let result = StrapTrack::parse_line("key1 invalid_float key2 2.0", true);
+        let result = StrapTrack::parse_line("key1 invalid_float key2 2.0", true).unwrap();
         assert!(!result.contains_key("key1"));
         assert_eq!(result.get("key2"), Some(&2.0));
         let result = StrapTrack::parse_line("key1 invalid_float key2 2.0", false);
-        assert!(result.is_empty());
+        assert!(result.is_none());
     }
 
     #[test]
@@ -583,20 +587,20 @@ mod tests {
 
     #[test]
     fn test_strap_with_digits() {
-        let result = StrapTrack::parse_line("@strap2 key 1.0", false);
+        let result = StrapTrack::parse_line("@strap2 key 1.0", false).unwrap();
         assert_eq!(result.get("key"), Some(&1.0));
     }
 
     #[test]
     fn test_scientific_notation() {
-        let result = StrapTrack::parse_line("temp 3.14e2 pressure 1.01e5", true);
+        let result = StrapTrack::parse_line("temp 3.14e2 pressure 1.01e5", true).unwrap();
         assert_eq!(result.get("temp"), Some(&314.0));
         assert_eq!(result.get("pressure"), Some(&101000.0));
     }
 
     #[test]
     fn test_negative_values() {
-        let result = StrapTrack::parse_line("deficit -42.5 surplus 100.0", true);
+        let result = StrapTrack::parse_line("deficit -42.5 surplus 100.0", true).unwrap();
         assert_eq!(result.get("deficit"), Some(&-42.5));
         assert_eq!(result.get("surplus"), Some(&100.0));
     }
